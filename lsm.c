@@ -207,28 +207,6 @@ void build_filter(int* arr, char* bloom, int num_hash) {
 }
 
 
-int get(int key) {
-
-    int val = 0;
-    // linear O(n) search through buffer heap 
-    for(int i = 0; i < L0->heap_size; i++) {
-        if(key == L0->data[i].key) {
-            return L0->data[i].val;
-        }
-    }
-    // if not found in buffer, search LSM tree on disk
-    for(int i = 0; i < NUM_LEVELS; i++) {
-        for(int j = levels[i]->run_cnt; j > 0; j--) { // Go to most recent run first since it may contain updated keys
-            if(bloom_test(key, i, j)) {
-                if((val = search_fences(key, i, j)) != 0 ) {            
-                    return val;
-                }
-            }
-        }
-    }
-
-    return val;
-}
 
     double x = ceil(bits_per_entry * log(2));
     x = x + 0.5 - (x<0); // x is now 55.499999...
@@ -279,6 +257,90 @@ int comparator(const void* e1, const void* e2) {
     return (((struct entry*) e1)->key > ((struct entry*) e2)->key ? 1 : -1);
 } 
 
+
+
+void buffer_flush() {
+
+    char filename[256];
+    sprintf(filename, "level1_run%d.bin", level[0]->run_cnt);
+
+    FILE* fp = fopen(filename , "wb");
+    if(!fp) {
+        printf("Error: Could not open file\n");
+        exit(1);
+    }
+
+    fwrite(L0->data + 1, sizeof(struct entry), L0->length, fp);
+    fclose(fp);
+
+    // write lock the levels[0] table here
+
+    levels[0]->run_cnt++;
+
+    // write unlock the levels[0] table here
+    L0->heap_size = 0;
+
+    merge_and_flush(0) // launch merge/flush on separate thread so it happens in background
+    
+
+}
+
+
+void merge_and_flush(int i) {
+    
+    // only flush to disk if num_files in level i == SZ_RATIO
+    if(levels[0]->run_cnt < SZ_RATIO) {
+        return; 
+    } else {
+
+    - get filenames of runs in level i
+    - sort-merge the runs in level i via external sort
+    - create new bloom filter and fence pointer array during merge
+    - write new file to disk
+    - lock levels table
+    - remove file names of the runs in level i, memset(0) all the bloom filters in level i
+    - add a new run in new filename in next level i+1, 
+
+        r = level[i+1]->run_cnt
+        level[i+1]->runs[r]->filename = new_filename;
+        level[i+1]->run_cnt++;
+
+        levels[i]->runs[run_cnt]->file = NULL;
+        levels[i]->runs[j]->bloom = new_bloom;
+        levels[i]->runs[j]->fences = (struct fence*) malloc(sizeof(struct fence) * 
+                                    ((M_BUFFER * pow(SZ_RATIO, (i+1))) / PAGE_SZ) );
+
+    - unlock levels table
+
+        merge_and_flush(i+1) // cascade merge/flush
+        
+    }
+}
+
+
+int get(int key) {
+
+    int val = 0;
+    // linear O(n) search through buffer heap 
+    for(int i = 0; i < L0->heap_size; i++) {
+        if(key == L0->data[i].key) {
+            return L0->data[i].val;
+        }
+    }
+    // if not found in buffer, search LSM tree on disk
+    for(int i = 0; i < NUM_LEVELS; i++) {
+        for(int j = levels[i]->run_cnt; j > 0; j--) { // Go to most recent run first since it may contain updated keys
+            if(bloom_test(key, i, j)) {
+                if((val = search_fences(key, i, j)) != 0 ) {            
+                    return val;
+                }
+            }
+        }
+    }
+
+    return val;
+}
+
 // If multiple runs that are being sort-merged contain entries with the same key, 
 // only the entry from the most recently-created (youngest) run is kept because it 
 // is the most up-to-date. Thus, the resulting run may be smaller than the cumulative sizes of the original runs. When
@@ -310,7 +372,6 @@ void buffer_insert(struct query q) {
 
 
 // load queries statically from a file
-// void buffer_load(const struct gheap_ctx *const ctx, char* filename) {
 void buffer_load(char* filename) {
 
     char line[31];
@@ -334,18 +395,17 @@ void buffer_load(char* filename) {
                     q.type = PUT;
                     q.inp1 = atoi(strtok(NULL, delims));
                     q.inp2 = atoi(strtok(NULL, delims));
-                    // buffer_insert(ctx, q);
                     buffer_insert(q);
                     break;
                 case 'd': 
                     q.type = DELETE;
                     q.inp1 = atoi(strtok(NULL, delims));
-                    // buffer_insert(ctx, q);
                     buffer_insert(q);
                     break;
                 case 'g': 
                     q.type = GET;
                     q.inp1 = atoi(strtok(NULL, delims));
+                    get(q.inp1)
                     break; 
                 case 'r': 
                     q.type = RANGE;
@@ -373,48 +433,6 @@ void buffer_free() {
 
 
 // size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream)
-void buffer_flush() {
-
-    char filename[256];
-    sprintf(filename, "level1_run%d.bin", level[1]->run_cnt);
-
-    FILE* fp = fopen(filename , "wb");
-    if(!fp) {
-        printf("Error: Could not open file\n");
-        exit(1);
-    }
-
-    fwrite(L0->data + 1, sizeof(struct entry), L0->length, fp);
-    fclose(fp);
-
-    // write lock the levels[1] table here
-
-    levels[0]->run_cnt++;
-
-    // write unlock the levels[1] table here
-    L0->heap_size = 0;
-
-    // get num_files from L1
-    // only flush to disk if num_files in L1 > SZ_RATIO
-
-    if(levels[1]->run_cnt == SZ_RATIO) {
-        merge_and_flush(1) // launch merge/flush on separate thread so it happens in background
-    }
-
-}
-
-
-void merge_and_flush(int lev) {
-    next_
-    if(lev->run_cnt == SZ_RATIO) {
-
-    }
-
-
-    if(this level is full too)
-        merge_and_flush() // cascade merge/flush
-}
-
 
 int main(int argc, char* argv[]) {
 
