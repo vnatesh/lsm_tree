@@ -49,7 +49,7 @@ struct file_pair {
 static pthread_rwlock_t rwlock;
 static int SZ_RATIO = 10;
 static unsigned long long int M_BUFFER;
-static int filesize = 1000;
+static int filesize = 100;
 
 static int done = 0;
 
@@ -101,10 +101,15 @@ int main(int argc, char* argv[]) {
 
     pool = threadpool_create(MAX_THREADS, MAX_QUEUE, 0);
 
-    // if (pthread_rwlock_init(&rwlock, NULL) != 0) { 
-    //     printf("\nError: rwlock init failed\n"); 
-    //     return 1; 
-    // } 
+    // read-write lock to manage access to the levels metadata
+    if (pthread_rwlock_init(&rwlock, NULL) != 0) { 
+        printf("\nError: rwlock init failed\n"); 
+        return 1; 
+    } 
+
+	struct timeval start, end;
+	double diff_t;
+	gettimeofday (&start, NULL);
 
     // group_len is the maximum number of bits i.e. groups we would need to track
     // g_cnt is the actual number of groups that we track i.e. where bit is 1
@@ -143,7 +148,6 @@ int main(int argc, char* argv[]) {
 	    }  
     } 
 
-
     // We start the merge process by starting work (merge) on the larger groups (size determined by MSB of SZ_RATIO in binary)
     // first so that the smaller groups can be merging simulatenously and possibly finish before the large group. Small group
     // threads can be running while large group is running
@@ -152,15 +156,12 @@ int main(int argc, char* argv[]) {
 
     for(int i = (group_len*2) - 1; i > 0; i -= 2) {
     	if(groups[i] != -1) {
-	    	printf("HEYY %d  %d %d\n", group_wait,	groups[i-1], groups[i]);
+	    	// printf("HEYY %d  %d %d\n", group_wait,	groups[i-1], groups[i]);
 	    	outs[x] = k_way_merge(groups[i-1], groups[i], x);
-	    	printf("done with file %s and x is %d\n", outs[x]->out_f, x);
+	    	// printf("done with file %s and x is %d\n", outs[x]->out_f, x);
 	    	x++;
     	}
     }
-
-    // exit(1);
-
 
     while(group_wait != 0) {}
 
@@ -181,9 +182,9 @@ int main(int argc, char* argv[]) {
     	output.group = 0;
     	output.f1_size = outs[1]->f1_size + outs[1]->f2_size;
     	output.f2_size = outs[0]->f1_size + outs[0]->f2_size;
-    	sprintf(output.out_f, "data/file_%d_%d", level, run);
+    	sprintf(output.out_f, "data/file_%d_%d.bin", level, run);
     	binary_merge((void*) &output);
-    	
+
     	printf("FINAL FILE %s\n", output.out_f);
     
     } else if(g_cnt == 3) {
@@ -201,49 +202,27 @@ int main(int argc, char* argv[]) {
     	output.group = 0;
     	output.f1_size = outs[2]->f1_size + outs[2]->f2_size;
     	output.f2_size = outs[0]->f1_size + outs[0]->f2_size;
-    	sprintf(output.out_f, "data/file_%d_%d", level, run);
+    	sprintf(output.out_f, "data/file_%d_%d.bin", level, run);
     	binary_merge((void*) &output);
 
     	printf("FINAL FILE %s\n", output.out_f);
     }
 
-    // rwlock write lock the levels table, and delete all old files and intermediate files, update
+    gettimeofday (&end, NULL);
+    diff_t = (((end.tv_sec - start.tv_sec)*1000000L
+        +end.tv_usec) - start.tv_usec) / (1000000.0);
+    printf("merge time : %f\n", diff_t); 
+
+    // TODO : rwlock write lock the levels table, and delete all old files and intermediate files, update
     // levels metadata
     // now unlock the rwlock
-
-	// done = SZ_RATIO / 2;
-
-	// int* q = (int*) malloc(done * sizeof(int));
-
-
-	// struct timeval start, end;
- //    double diff_t;
-
-
- //    gettimeofday (&start, NULL);
-
-	// for(int i = 0; i < SZ_RATIO-1; i+=2) {
-	// 	q[i/2] = i;
-	// 	// printf("%d\n", q);
-	// 	threadpool_add(pool, binary_merge, (void*) &q[i/2] , 1);
-	// 	// binary_merge((void*) &q[i/2]);
-	// }
-
-	// while(done != 0) {}
-	// // printf("done : %d\n ", done );
-
- //    gettimeofday (&end, NULL);
- //    diff_t = (((end.tv_sec - start.tv_sec)*1000000L
- //        +end.tv_usec) - start.tv_usec) / (1000000.0);
- //    printf("merge time : %f\n", diff_t); 
-
 
     for(int i = 0; i < g_cnt; i++) {
     	pthread_mutex_destroy(&k_locks[i]); 
     }
 
-	// pthread_mutex_destroy(&lock); 
-    // pthread_rwlock_destroy(&rwlock);
+    pthread_mutex_destroy(&group_lock); 
+    pthread_rwlock_destroy(&rwlock);
     threadpool_destroy(pool, 1);
     free(data);
 
@@ -279,13 +258,13 @@ struct file_pair* k_way_merge(int start, int end, int g_id) {
 	q[ind] = (struct file_pair*) malloc(sizeof(struct file_pair) * (k/2));
 
 
-	printf("sub-group %d\n\n", ind);
+	// printf("sub-group %d\n\n", ind);
 	for(int i = start; i < end; i+=2) {
 
-	    printf("data/file_%d.bin  ", i);
-	    printf("data/file_%d.bin  ", i+1);
-	    printf("data/out_%d_%d.bin\n", i+1, ind);
-		printf("\n\n");
+	 //    printf("data/file_%d.bin  ", i);
+	 //    printf("data/file_%d.bin  ", i+1);
+	 //    printf("data/out_%d_%d.bin\n", i+1, ind);
+		// printf("\n\n");
 	    sprintf(q[ind][p_ind].f1, "data/file_%d.bin", i);
 	    sprintf(q[ind][p_ind].f2, "data/file_%d.bin", i+1);
 	    sprintf(q[ind][p_ind].out_f, "data/out_%d_%d.bin", i+1, ind);
@@ -307,12 +286,12 @@ struct file_pair* k_way_merge(int start, int end, int g_id) {
 		p_ind = 0;
 		q[ind] = (struct file_pair*) malloc(sizeof(struct file_pair) * (k/2));
 
-		printf("sub-group %d\n\n", ind);
+		// printf("sub-group %d\n\n", ind);
 		for(int i = j; i < k; i += 2*j) {
-			printf("data/out_%d_%d.bin  ", i + start - 1, ind - 1);
-			printf("data/out_%d_%d.bin  ", i + start + j - 1, ind - 1);
-			printf("data/out_%d_%d.bin\n", i + start + j - 1, ind);
-			printf("\n\n");
+			// printf("data/out_%d_%d.bin  ", i + start - 1, ind - 1);
+			// printf("data/out_%d_%d.bin  ", i + start + j - 1, ind - 1);
+			// printf("data/out_%d_%d.bin\n", i + start + j - 1, ind);
+			// printf("\n\n");
 		    sprintf(q[ind][p_ind].f1, "data/out_%d_%d.bin", i + start - 1, ind - 1);
 		    sprintf(q[ind][p_ind].f2, "data/out_%d_%d.bin", i + start + j - 1, ind - 1);
 		    sprintf(q[ind][p_ind].out_f, "data/out_%d_%d.bin", i + start + j - 1, ind);
@@ -324,7 +303,7 @@ struct file_pair* k_way_merge(int start, int end, int g_id) {
 		    p_ind++;
 		}
 
-		printf("\n\n\n\n\n");
+		// printf("\n\n\n\n\n");
 
 		ind++;
 		j *= 2;
@@ -353,7 +332,7 @@ struct file_pair* k_way_merge(int start, int end, int g_id) {
 void binary_merge(void* inp) {
 
 	struct file_pair f_pair = *((struct file_pair*) inp);
-	printf("yo %s %s %s %d %d %d\n", f_pair.f1, f_pair.f2, f_pair.out_f, f_pair.f1_size, f_pair.f2_size, f_pair.group);
+	// printf("yo %s %s %s %d %d %d\n", f_pair.f1, f_pair.f2, f_pair.out_f, f_pair.f1_size, f_pair.f2_size, f_pair.group);
 	// return;
 
     // int inp_size1 = filesize * sizeof(struct entry) * f_pair.f1_size;
