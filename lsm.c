@@ -116,7 +116,7 @@ void levels_init() {
     // user supplies bits per entry for level 1 (L1_BPE)
     double p1 = exp(-L1_BPE * pow(log(2),2));
     // get the # of levels for which we assign bloom filters. All levels >= this one will not be given any filters
-    int filtered_levels =  (((double) L1_BPE) * pow(log(2),2)) / (log(SZ_RATIO));
+    int filtered_levels =  (int) floor((((double) L1_BPE) * pow(log(2),2)) / (log(SZ_RATIO)));
     int bits_per_entry;
     int num_hash;
     int entries_per_run;
@@ -164,6 +164,7 @@ void levels_init() {
 
 
 // From "Less Hashing, Same Performance: Building a Better Bloom Filter Adam Kirsch, Michael Mitzenmacher"
+// http://citeseerx.ist.psu.edu/viewdoc/download;jsessionid=95B8140B9772E2DDB24199DA24DE5DB1?doi=10.1.1.152.579&rep=rep1&type=pdf
 // gi(x) = h1(x) + ih2(x)
 void bloom_set(int key, int i, int j) {
 
@@ -270,13 +271,13 @@ void buffer_flush() {
         exit(1);
     }
 
+    qsort((void*) (L0->data + 1), (size_t) L0->heap_size, sizeof(struct entry), comparator);
+
     fwrite(L0->data + 1, sizeof(struct entry), L0->length, fp);
     fclose(fp);
 
     // write lock the levels[0] table here
-
     levels[0]->run_cnt++;
-
     // write unlock the levels[0] table here
     L0->heap_size = 0;
 
@@ -441,7 +442,7 @@ int main(int argc, char* argv[]) {
     struct timeval start, end;
     double diff_t;
 
-    while((opt = getopt(argc, argv, "r:b:c:f::")) != -1) { // optional argument for static workload -f is denoted by ::
+    while((opt = getopt(argc, argv, "r:b:c:d:e:f::")) != -1) { // optional argument for static workload -f is denoted by ::
         switch(opt) {
             case 'r':
                 SZ_RATIO = atoi(optarg);
@@ -464,7 +465,7 @@ int main(int argc, char* argv[]) {
                 break;
 
             case 'e':
-                L1_BPE = atoi(optarg);
+                L1_BPE = atoi(optarg); // bits per entry in L1
                 break;
 
             case '?':
@@ -590,6 +591,8 @@ int main(int argc, char* argv[]) {
 
 // gcc -Wall -g -O0 -DNDEBUG -pthread lsm.c -o lsm
 // ./lsm -r2 -b32 -ftest.txt -c1
+
+
 
 // heap size : 200010
 // old buffer load time: 0.019460
