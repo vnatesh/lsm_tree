@@ -62,7 +62,7 @@ static pthread_mutex_t group_lock;
 static pthread_mutex_t* k_locks;
 
 void binary_merge(void* inp);
-void run_test(threadpool_t* pool);
+void run_test(void* tmp);
 int comparator(const void* e1, const void* e2);
 struct file_pair* k_way_merge(int start, int end, int g_id);
 
@@ -107,13 +107,41 @@ int main(int argc, char* argv[]) {
         return 1; 
     } 
 
+    int tmp = 0;
+    threadpool_add(pool, run_test, (void*) &tmp , 1);
+
+    free(data);
+
+    printf("heyyy\n");
+    printf("heyyy\n");
+    printf("heyyy\n");
+    printf("heyyy\n");
+
+    sleep(100);
+    return 0;
+
+    // for(int i = 0; i < g_cnt; i++) {
+    //  pthread_mutex_destroy(&k_locks[i]); 
+    // }
+
+    // pthread_mutex_destroy(&group_lock); 
+    // pthread_rwlock_destroy(&rwlock);
+    // free(k_locks);
+    // free(k_wait);
+    // free(groups);
+    // threadpool_destroy(pool, 1);
+}
+
+
+void run_test(void* tmp) {
+
 	struct timeval start, end;
 	double diff_t;
 	gettimeofday (&start, NULL);
 
     // group_len is the maximum number of bits i.e. groups we would need to track
     // g_cnt is the actual number of groups that we track i.e. where bit is 1
-	int group_len = (int) (floor(log2(SZ_RATIO)) + 1);
+    int group_len = (int) (floor(log2(SZ_RATIO)) + 1);
     group_wait = 0;
     int n = SZ_RATIO;
     int* groups = (int*) malloc(sizeof(int) * group_len * 2);
@@ -123,29 +151,31 @@ int main(int argc, char* argv[]) {
     // convert n to binary, find position where val is 1 and create group of size 2^position
     for(int i = 0; n > 0; i += 2) {
 
-    	if(n % 2) {
-    		printf("curr %d\n",curr );
-    		groups[i] = curr;
-	    	curr += ((int) pow(2, i/2));
-	    	groups[i+1] = curr;
-	    	group_wait++;
-    	} else {
-    		groups[i] = -1;
-    		groups[i + 1] = -1;
-    	}
+        if(n % 2) {
+            printf("curr %d\n",curr );
+            groups[i] = curr;
+            curr += ((int) pow(2, i/2));
+            groups[i+1] = curr;
+            group_wait++;
+        } else {
+            groups[i] = -1;
+            groups[i + 1] = -1;
+        }
 
-    	n /= 2;
+        n /= 2;
     }
 
     g_cnt = group_wait;
+
+    // TODO : move these into main function of lsm.c...build all locks/k_wait beforehand a single time
     k_wait = (int*) malloc(sizeof(int) * g_cnt);
     k_locks = (pthread_mutex_t*) malloc(sizeof(pthread_mutex_t) * g_cnt);
 
     for(int i = 0; i < g_cnt; i++) {
-	    if (pthread_mutex_init(&k_locks[i], NULL) != 0) { 
-	        printf("\nError: mutex init failed\n"); 
-	        return 1; 
-	    }  
+        if (pthread_mutex_init(&k_locks[i], NULL) != 0) { 
+            printf("\nError: mutex init failed\n"); 
+            return ; 
+        }  
     } 
 
     // We start the merge process by starting work (merge) on the larger groups (size determined by MSB of SZ_RATIO in binary)
@@ -217,20 +247,7 @@ int main(int argc, char* argv[]) {
     // levels metadata
     // now unlock the rwlock
 
-    for(int i = 0; i < g_cnt; i++) {
-    	pthread_mutex_destroy(&k_locks[i]); 
-    }
-
-    pthread_mutex_destroy(&group_lock); 
-    pthread_rwlock_destroy(&rwlock);
-    threadpool_destroy(pool, 1);
-    free(data);
-
-    free(k_locks);
-    free(k_wait);
-    free(groups);
-
-	return 0;
+	return ;
 }
 
 
@@ -239,7 +256,6 @@ int main(int argc, char* argv[]) {
 struct file_pair* k_way_merge(int start, int end, int g_id) {
 
     int k = end - start;
-
 	if(k < 2) {
 		// do nothing, you need at least k=2 files to merge
 		struct file_pair* a = (struct file_pair*) malloc(sizeof(struct file_pair) * 1);
