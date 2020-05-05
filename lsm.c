@@ -72,8 +72,18 @@ struct level {
     enum policy pol;
 }
 
+// file_pair for binary merge
+struct file_pair {
+    char f1[32];
+    char f2[32];
+    char out_f[32];
+    int group;
+    int f1_size;
+    int f2_size;
+};
+
+
 static const char delims[] = " ";
-static pthread_rwlock_t rwlock;
 static int SZ_RATIO;
 static unsigned long long int M_BUFFER;
 static char* static_workload = NULL;
@@ -85,6 +95,21 @@ static struct level* levels;
 static unsigned long long int MAX_MEM;
 static int NUM_LEVELS;
 static int L1_BPE;
+
+
+static threadpool_t* pool;
+
+// global vars for merge threads
+static int g_cnt = 0; // number of merge groups (# of 1's in bin(SZ_RATIO))
+static int* groups; // file ranges for each group (start,end)
+static int group_wait = 0;
+static int* k_wait = NULL;
+
+// locks
+static pthread_mutex_t group_lock;
+static pthread_mutex_t* k_locks;
+static pthread_rwlock_t rwlock;
+
 
 // L0 buffer functions
 void buffer_init();
@@ -101,6 +126,48 @@ void build_filter(int* arr, char* bloom, int num_hash);
 void bloom_set(char* bloom, int key, int num_hash);
 bool bloom_test(char* bloom, int key, int num_hash);
 
+// k-way merge functions
+void binary_merge(void* inp);
+struct file_pair* k_way_merge(int start, int end, int g_id);
+void launch_merge(void* tmp);
+
+// locks
+void locks_init();
+void locks_destroy();
+
+
+
+
+
+
+void locks_init() { 
+
+    // read-write lock to manage access to the levels metadata
+    if (pthread_rwlock_init(&rwlock, NULL) != 0) { 
+        printf("\nError: rwlock init failed\n"); 
+        exit(1); 
+    } 
+
+    int n = SZ_RATIO;
+    // convert n to binary, find position where val is 1 and create group of size 2^position
+    for(int i = 0; n > 0; i += 2) {
+        if(n % 2) {
+            g_cnt++;
+        } 
+        n /= 2;
+    }
+
+    // TODO : move these into main function of lsm.c...build all locks/k_wait beforehand a single time
+    k_wait = (int*) malloc(sizeof(int) * g_cnt);
+    k_locks = (pthread_mutex_t*) malloc(sizeof(pthread_mutex_t) * g_cnt);
+
+    for(int i = 0; i < g_cnt; i++) {
+        if (pthread_mutex_init(&k_locks[i], NULL) != 0) { 
+            printf("\nError: mutex init failed\n"); 
+            return ; 
+        }  
+    } 
+}
 
 // This function initializes metadata for each level in the LSM tree according to 
 // user defined policies (leveling, tiering, lazy leveling). It also implements the 
@@ -237,7 +304,7 @@ void build_filter(int* arr, char* bloom, int num_hash) {
 
     printf("\n\n FPR : %.9lf\n", ((double) fp_cnt) / ((double) num_entries));
 
-// write optimized buffer...insert O(1) (average case), delete O(lgn), but reads (search) is O(n)
+// write-optimized buffer...insert O(1) (average case), delete O(lgn), but reads (search) is O(n)
 void buffer_init() {
 
     L0 = (struct buffer*) malloc(sizeof(struct buffer));
@@ -263,7 +330,7 @@ int comparator(const void* e1, const void* e2) {
 void buffer_flush() {
 
     char filename[256];
-    sprintf(filename, "level1_run%d.bin", level[0]->run_cnt);
+    sprintf(filename, "level_0_run%d.bin", level[0]->run_cnt);
 
     FILE* fp = fopen(filename , "wb");
     if(!fp) {
@@ -281,42 +348,294 @@ void buffer_flush() {
     // write unlock the levels[0] table here
     L0->heap_size = 0;
 
-    merge_and_flush(0) // launch merge/flush on separate thread so it happens in background
-    
-
+    // launch merge/flush on separate thread so it happens in background
+    int p = 0;
+    threadpool_add(pool, merge_and_flush, (void*) &p , 1);
+    // merge_and_flush(0);
 }
 
 
-void merge_and_flush(int i) {
+void merge_and_flush(void* p) {
     
+    int i = *((int*) p);
     // only flush to disk if num_files in level i == SZ_RATIO
-    if(levels[0]->run_cnt < SZ_RATIO) {
+    if(levels[i]->run_cnt < SZ_RATIO) {
         return; 
-    } else {
-
-    - get filenames of runs in level i
-    - sort-merge the runs in level i via external sort
-    - create new bloom filter and fence pointer array during merge
-    - write new file to disk
-    - lock levels table
-    - remove file names of the runs in level i, memset(0) all the bloom filters in level i
-    - add a new run in new filename in next level i+1, 
-
-        r = level[i+1]->run_cnt
-        level[i+1]->runs[r]->filename = new_filename;
-        level[i+1]->run_cnt++;
-
-        levels[i]->runs[run_cnt]->file = NULL;
-        levels[i]->runs[j]->bloom = new_bloom;
-        levels[i]->runs[j]->fences = (struct fence*) malloc(sizeof(struct fence) * 
-                                    ((M_BUFFER * pow(SZ_RATIO, (i+1))) / PAGE_SZ) );
-
-    - unlock levels table
-
-        merge_and_flush(i+1) // cascade merge/flush
-        
     }
+
+    // - get filenames of runs in level i
+    // - sort-merge the runs in level i via external sort
+    // - create new bloom filter and fence pointer array during merge
+    // - write new file to disk
+    // - lock levels table
+    // - remove file names of the runs in level i, memset(0) all the bloom filters in level i
+    // - add a new run in new filename in next level i+1, 
+
+    //     r = level[i+1]->run_cnt
+    //     level[i+1]->runs[r]->filename = new_filename;
+    //     level[i+1]->run_cnt++;
+
+    //     levels[i]->runs[run_cnt]->file = NULL;
+    //     levels[i]->runs[j]->bloom = new_bloom;
+    //     levels[i]->runs[j]->fences = (struct fence*) malloc(sizeof(struct fence) * 
+    //                                 ((M_BUFFER * pow(SZ_RATIO, (i+1))) / PAGE_SZ) );
+
+    // - unlock levels table
+
+    //     merge_and_flush(i+1) // cascade merge/flush
+        
+    static int filesize = 100;
+
+    int tmp = 0;
+    threadpool_add(pool, launch_merge, (void*) &tmp , 1);
+
+    return 0;
 }
+
+
+void launch_merge(void* tmp) {
+
+    // group_len is the maximum number of bits i.e. groups we would need to track
+    // g_cnt is the actual number of groups that we track i.e. where bit is 1
+    int group_len = (int) (floor(log2(SZ_RATIO)) + 1);
+    group_wait = 0;
+    int n = SZ_RATIO;
+    groups = (int*) malloc(sizeof(int) * group_len * 2);
+    int curr = 0;
+
+    // convert n to binary, find position where val is 1 and create group of size 2^position
+    for(int i = 0; n > 0; i += 2) {
+
+        if(n % 2) {
+            printf("curr %d\n",curr );
+            groups[i] = curr;
+            curr += ((int) pow(2, i/2));
+            groups[i+1] = curr;
+            group_wait++;
+        } else {
+            groups[i] = -1;
+            groups[i + 1] = -1;
+        }
+
+        n /= 2;
+    }
+
+    // We start the merge process by starting work (merge) on the larger groups (size determined by MSB of SZ_RATIO in binary)
+    // first so that the smaller groups can be merging simulatenously and possibly finish before the large group. Small group
+    // threads can be running while large group is running
+    int x = 0;
+    struct file_pair* outs[g_cnt+1]; 
+
+    for(int i = (group_len*2) - 1; i > 0; i -= 2) {
+        if(groups[i] != -1) {
+            outs[x] = k_way_merge(groups[i-1], groups[i], x);
+            x++;
+        }
+    }
+
+    while(group_wait != 0) {}
+
+    int level = 3;
+    int run = 4;
+    struct file_pair output;
+    char newname[32];
+
+    // since SZ_RATIO is maxed at 10, at most 3 groups will be present (3 out of 4 bits turned on)
+    if(g_cnt == 1) {
+        sprintf(newname, "data/file_%d_%d.bin", level, run);
+        rename(outs[0]->out_f, newname);
+    
+    } else if(g_cnt == 2) {
+
+        strcpy(output.f1, outs[1]->out_f);
+        strcpy(output.f2, outs[0]->out_f);
+        output.group = 0;
+        output.f1_size = outs[1]->f1_size + outs[1]->f2_size;
+        output.f2_size = outs[0]->f1_size + outs[0]->f2_size;
+        sprintf(output.out_f, "data/file_%d_%d.bin", level, run);
+        binary_merge((void*) &output);
+
+        printf("FINAL FILE %s\n", output.out_f);
+    
+    } else if(g_cnt == 3) {
+
+        strcpy(output.f1, outs[2]->out_f);
+        strcpy(output.f2, outs[1]->out_f);
+        output.group = 0;
+        output.f1_size = outs[2]->f1_size + outs[2]->f2_size;
+        output.f2_size = outs[1]->f1_size + outs[1]->f2_size;
+        sprintf(output.out_f, "data/intermediate");
+        binary_merge((void*) &output);
+
+        sprintf(output.f1, "data/intermediate");
+        strcpy(output.f2, outs[0]->out_f);
+        output.group = 0;
+        output.f1_size = outs[2]->f1_size + outs[2]->f2_size;
+        output.f2_size = outs[0]->f1_size + outs[0]->f2_size;
+        sprintf(output.out_f, "data/file_%d_%d.bin", level, run);
+        binary_merge((void*) &output);
+    }
+
+    // TODO : rwlock write lock the levels table, and delete all old files and intermediate files, update
+    // levels metadata
+    // now unlock the rwlock
+
+    return ;
+}
+
+
+// Merge k = (end-start) files together in parallel. k (a) is guaranteed to be a power of 2.
+// Launch a binary merge on each of log2(k) threads in parallel
+struct file_pair* k_way_merge(int start, int end, int g_id) {
+
+    int k = end - start;
+    if(k < 2) {
+        // do nothing, you need at least k=2 files to merge
+        struct file_pair* a = (struct file_pair*) malloc(sizeof(struct file_pair) * 1);
+        sprintf(a->out_f, "data/file_%d.bin", start);
+        a->group = g_id;
+
+        return a;
+    }
+
+    int ind = 0;
+    int p_ind = 0;
+
+    struct file_pair** q = (struct file_pair**) malloc(sizeof(struct file_pair*) * ((int) log2(k)));
+    q[ind] = (struct file_pair*) malloc(sizeof(struct file_pair) * (k/2));
+
+    for(int i = start; i < end; i+=2) {
+        sprintf(q[ind][p_ind].f1, "data/file_%d.bin", i);
+        sprintf(q[ind][p_ind].f2, "data/file_%d.bin", i+1);
+        sprintf(q[ind][p_ind].out_f, "data/out_%d_%d.bin", i+1, ind);
+        q[ind][p_ind].group = g_id;
+
+        q[ind][p_ind].f1_size = filesize;
+        q[ind][p_ind].f2_size = filesize;
+
+        p_ind++;
+    } 
+
+    ind++;
+    int j = 2;
+    
+    while(ind < ((int) log2(k))) {
+
+        p_ind = 0;
+        q[ind] = (struct file_pair*) malloc(sizeof(struct file_pair) * (k/2));
+
+        for(int i = j; i < k; i += 2*j) {
+            sprintf(q[ind][p_ind].f1, "data/out_%d_%d.bin", i + start - 1, ind - 1);
+            sprintf(q[ind][p_ind].f2, "data/out_%d_%d.bin", i + start + j - 1, ind - 1);
+            sprintf(q[ind][p_ind].out_f, "data/out_%d_%d.bin", i + start + j - 1, ind);
+            q[ind][p_ind].group = g_id;
+
+            q[ind][p_ind].f1_size = filesize * j;
+            q[ind][p_ind].f2_size = filesize * j;
+
+            p_ind++;
+        }
+
+        ind++;
+        j *= 2;
+    }
+ 
+    for(int i = 0; i < ((int) log2(k)); i++) {
+        k_wait[g_id] = (int) pow(2, (((int) log2(k)) - i - 1));
+        for(int j = 0; j < (k/2); j++) {
+            if(strlen(q[i][j].f1) != 0) {
+                threadpool_add(pool, binary_merge, (void*) &q[i][j] , 1);
+            }
+        }
+
+        while(k_wait[g_id] != 0) {}
+    }
+
+    pthread_mutex_lock(&group_lock); 
+    group_wait--;
+    pthread_mutex_unlock(&group_lock); 
+    
+    return &(q[((int) log2(k)) - 1][0]);
+}
+
+
+void binary_merge(void* inp) {
+
+    struct file_pair f_pair = *((struct file_pair*) inp);
+
+    int inp_size1 = f_pair.f1_size * sizeof(struct entry);
+    int inp_size2 = f_pair.f2_size * sizeof(struct entry);
+    int out_size = inp_size1 + inp_size2;
+
+
+    int fd1 = open(f_pair.f1, O_RDONLY, S_IRUSR | S_IWUSR);
+    int fd2 = open(f_pair.f2, O_RDONLY, S_IRUSR | S_IWUSR);
+
+    struct entry* m1 = mmap(NULL, inp_size1, PROT_READ, MAP_PRIVATE, fd1, 0);
+    struct entry* m2 = mmap(NULL, inp_size2, PROT_READ, MAP_PRIVATE, fd2, 0);
+
+    int out = open(f_pair.out_f, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
+
+    ftruncate(out, out_size);
+
+    // create output mmap of size equal to sum of input files
+    struct entry* m_out = mmap(NULL, out_size, PROT_READ | PROT_WRITE, MAP_SHARED, out, 0);
+
+    // merge algorithm. 
+    // TODO : Do updates and deletes here
+    int i = 0;
+    int j = 0;
+    int k = 0;
+
+    while (i < f_pair.f1_size && j < f_pair.f2_size) {
+        if(m1[i].key <= m2[j].key) { 
+            m_out[k] = m1[i];
+            i++; 
+        } else { 
+            m_out[k] = m2[j];
+            j++; 
+        } 
+        k++; 
+    } 
+  
+    while (i < f_pair.f1_size) {
+        m_out[k] = m1[i];
+        i++; 
+        k++; 
+    } 
+  
+    while (j < f_pair.f2_size) {
+        m_out[k] = m2[j];
+        j++; 
+        k++; 
+    } 
+  
+
+    munmap(m1, inp_size1);
+    close(fd1);
+    munmap(m2, inp_size2);
+    close(fd2);
+    munmap(m_out, out_size);
+    close(out);
+
+    pthread_mutex_lock(&k_locks[f_pair.group]); 
+    k_wait[f_pair.group]--;
+    pthread_mutex_unlock(&k_locks[f_pair.group]); 
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 int get(int key) {
@@ -426,15 +745,6 @@ void buffer_load(char* filename) {
 }
 
 
-void buffer_free() {
-
-    free(L0->data);
-    free(L0);
-}
-
-
-// size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream)
-
 int main(int argc, char* argv[]) {
 
     int opt;
@@ -490,7 +800,11 @@ int main(int argc, char* argv[]) {
         }
     }
 
+
     buffer_init();
+    locks_init();
+    pool = threadpool_create(MAX_THREADS, MAX_QUEUE, 0);
+
 
     if(static_workload) {
 
@@ -522,10 +836,30 @@ int main(int argc, char* argv[]) {
     }
 
     buffer_free();
-
+    locks_destroy();
+    threadpool_destroy(pool, 1);
     return 1;
 }
 
+
+void buffer_free() {
+    free(L0->data);
+    free(L0);
+}
+
+
+void locks_destroy() {
+
+    for(int i = 0; i < g_cnt; i++) {
+        pthread_mutex_destroy(&k_locks[i]); 
+    }
+
+    pthread_mutex_destroy(&group_lock); 
+    pthread_rwlock_destroy(&rwlock);
+    free(k_locks);
+    free(k_wait);
+    free(groups);
+}
 
 
     // memset(bloom_f, 0, N)
@@ -711,5 +1045,42 @@ int main(int argc, char* argv[]) {
 // P = 8 (for now)
 
 // M_buffer = 8 * 8 * 512 = 32 KB
+
+
+
+
+
+
+
+
+
+// static int filesize = 10000000;
+
+// merge experiments...shows that parallel k-way merge is clearly faster than sequential
+
+// VNatesh:project vikas$ gcc -g  -pthread merge_test.c threadpool.c -o merge_test
+// VNatesh:project vikas$ ./merge_test
+// merge time : 0.848140
+// VNatesh:project vikas$ cd data/
+// VNatesh:data vikas$ rm file_*
+// VNatesh:data vikas$ rm out_*
+// VNatesh:data vikas$ cd ..
+// VNatesh:project vikas$ gcc -g  -pthread merge_test.c threadpool.c -o merge_test
+// VNatesh:project vikas$ ./merge_test
+// merge time : 2.162473
+
+
+
+// VNatesh:project vikas$ gcc -g  -pthread merge_test.c threadpool.c -o merge_test
+// VNatesh:project vikas$ ./merge_test
+// merge time : 2.090853
+// VNatesh:project vikas$ gcc -g  -pthread merge_test.c threadpool.c -o merge_test
+// VNatesh:project vikas$ ./merge_test
+// merge time : 0.754781
+// VNatesh:project vikas$ cd data/
+
+
+
+
 
 
