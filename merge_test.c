@@ -55,7 +55,8 @@ static int done = 0;
 
 static threadpool_t* pool;
 
-
+static int g_cnt = 0; // number of merge groups (# of 1's in bin(SZ_RATIO))
+static int* groups; // file ranges for each group (start,end)
 static int group_wait = 0;
 static int* k_wait = NULL;
 static pthread_mutex_t group_lock;
@@ -65,7 +66,8 @@ void binary_merge(void* inp);
 void run_test(void* tmp);
 int comparator(const void* e1, const void* e2);
 struct file_pair* k_way_merge(int start, int end, int g_id);
-
+void locks_init();
+void locks_destroy();
 
 
 int comparator(const void* e1, const void* e2) { 
@@ -101,11 +103,7 @@ int main(int argc, char* argv[]) {
 
     pool = threadpool_create(MAX_THREADS, MAX_QUEUE, 0);
 
-    // read-write lock to manage access to the levels metadata
-    if (pthread_rwlock_init(&rwlock, NULL) != 0) { 
-        printf("\nError: rwlock init failed\n"); 
-        return 1; 
-    } 
+    locks_init();
 
     int tmp = 0;
     threadpool_add(pool, run_test, (void*) &tmp , 1);
@@ -120,16 +118,52 @@ int main(int argc, char* argv[]) {
     sleep(100);
     return 0;
 
-    // for(int i = 0; i < g_cnt; i++) {
-    //  pthread_mutex_destroy(&k_locks[i]); 
-    // }
-
-    // pthread_mutex_destroy(&group_lock); 
-    // pthread_rwlock_destroy(&rwlock);
-    // free(k_locks);
-    // free(k_wait);
-    // free(groups);
+    // locks_destroy();
     // threadpool_destroy(pool, 1);
+}
+
+
+
+void locks_destroy() {
+
+    for(int i = 0; i < g_cnt; i++) {
+        pthread_mutex_destroy(&k_locks[i]); 
+    }
+
+    pthread_mutex_destroy(&group_lock); 
+    pthread_rwlock_destroy(&rwlock);
+    free(k_locks);
+    free(k_wait);
+    free(groups);
+}
+
+void locks_init() { 
+
+    // read-write lock to manage access to the levels metadata
+    if (pthread_rwlock_init(&rwlock, NULL) != 0) { 
+        printf("\nError: rwlock init failed\n"); 
+        return 1; 
+    } 
+
+    int n = SZ_RATIO;
+    // convert n to binary, find position where val is 1 and create group of size 2^position
+    for(int i = 0; n > 0; i += 2) {
+        if(n % 2) {
+            g_cnt++;
+        } 
+        n /= 2;
+    }
+
+    // TODO : move these into main function of lsm.c...build all locks/k_wait beforehand a single time
+    k_wait = (int*) malloc(sizeof(int) * g_cnt);
+    k_locks = (pthread_mutex_t*) malloc(sizeof(pthread_mutex_t) * g_cnt);
+
+    for(int i = 0; i < g_cnt; i++) {
+        if (pthread_mutex_init(&k_locks[i], NULL) != 0) { 
+            printf("\nError: mutex init failed\n"); 
+            return ; 
+        }  
+    } 
 }
 
 
@@ -144,9 +178,8 @@ void run_test(void* tmp) {
     int group_len = (int) (floor(log2(SZ_RATIO)) + 1);
     group_wait = 0;
     int n = SZ_RATIO;
-    int* groups = (int*) malloc(sizeof(int) * group_len * 2);
+    groups = (int*) malloc(sizeof(int) * group_len * 2);
     int curr = 0;
-    int g_cnt = 0;
 
     // convert n to binary, find position where val is 1 and create group of size 2^position
     for(int i = 0; n > 0; i += 2) {
@@ -165,18 +198,17 @@ void run_test(void* tmp) {
         n /= 2;
     }
 
-    g_cnt = group_wait;
 
     // TODO : move these into main function of lsm.c...build all locks/k_wait beforehand a single time
-    k_wait = (int*) malloc(sizeof(int) * g_cnt);
-    k_locks = (pthread_mutex_t*) malloc(sizeof(pthread_mutex_t) * g_cnt);
+    // k_wait = (int*) malloc(sizeof(int) * g_cnt);
+    // k_locks = (pthread_mutex_t*) malloc(sizeof(pthread_mutex_t) * g_cnt);
 
-    for(int i = 0; i < g_cnt; i++) {
-        if (pthread_mutex_init(&k_locks[i], NULL) != 0) { 
-            printf("\nError: mutex init failed\n"); 
-            return ; 
-        }  
-    } 
+    // for(int i = 0; i < g_cnt; i++) {
+    //     if (pthread_mutex_init(&k_locks[i], NULL) != 0) { 
+    //         printf("\nError: mutex init failed\n"); 
+    //         return ; 
+    //     }  
+    // } 
 
     // We start the merge process by starting work (merge) on the larger groups (size determined by MSB of SZ_RATIO in binary)
     // first so that the smaller groups can be merging simulatenously and possibly finish before the large group. Small group
