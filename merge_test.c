@@ -142,7 +142,7 @@ void locks_init() {
     // read-write lock to manage access to the levels metadata
     if (pthread_rwlock_init(&rwlock, NULL) != 0) { 
         printf("\nError: rwlock init failed\n"); 
-        return 1; 
+        exit(1); 
     } 
 
     int n = SZ_RATIO;
@@ -197,18 +197,6 @@ void run_test(void* tmp) {
 
         n /= 2;
     }
-
-
-    // TODO : move these into main function of lsm.c...build all locks/k_wait beforehand a single time
-    // k_wait = (int*) malloc(sizeof(int) * g_cnt);
-    // k_locks = (pthread_mutex_t*) malloc(sizeof(pthread_mutex_t) * g_cnt);
-
-    // for(int i = 0; i < g_cnt; i++) {
-    //     if (pthread_mutex_init(&k_locks[i], NULL) != 0) { 
-    //         printf("\nError: mutex init failed\n"); 
-    //         return ; 
-    //     }  
-    // } 
 
     // We start the merge process by starting work (merge) on the larger groups (size determined by MSB of SZ_RATIO in binary)
     // first so that the smaller groups can be merging simulatenously and possibly finish before the large group. Small group
