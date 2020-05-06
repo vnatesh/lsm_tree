@@ -54,23 +54,24 @@ struct buffer {
 struct fence{
     int min;
     int max;
-}
+};
 
 struct run {
     struct fence* fences;
     char* file;
     char* bloom;
-    int bits_per_entry;
-    int num_hash;
-}
+    // int bits_per_entry;
+    // int num_hash;
+};
 
 struct level {
     struct run* runs;
     int run_cnt;
-    int bits_per_entry; // # of bits per entry in bloom filter
+    int bits_per_entry; // # of bits per entry in bloom filters of this level
+    int num_hash;
     int entries_per_run; // # of entries per run. This is the max since some runs will have less due to deletes/updates
     enum policy pol;
-}
+};
 
 // file_pair for binary merge
 struct file_pair {
@@ -97,18 +98,21 @@ static int NUM_LEVELS;
 static int L1_BPE;
 
 
-static threadpool_t* pool;
+static threadpool_t* pool; // global thread pool
 
 // global vars for merge threads
 static int g_cnt = 0; // number of merge groups (# of 1's in bin(SZ_RATIO))
 static int* groups; // file ranges for each group (start,end)
 static int group_wait = 0;
 static int* k_wait = NULL;
+static int curr_merge_lev;
+static int merge_filesize;
 
 // locks
 static pthread_mutex_t group_lock;
 static pthread_mutex_t* k_locks;
 static pthread_rwlock_t rwlock;
+static pthread_mutex_t level_table_lock;
 
 
 // L0 buffer functions
@@ -122,23 +126,33 @@ void buffer_free();
 void buffer_flush();
 
 // bloom filter functions
-void build_filter(int* arr, char* bloom, int num_hash);
-void bloom_set(char* bloom, int key, int num_hash);
-bool bloom_test(char* bloom, int key, int num_hash);
+void build_filter(struct entry* data, int l, int r);
+void bloom_set(int key, int l, int r);
+bool bloom_test(int key, int i, int j);
 
 // k-way merge functions
-void binary_merge(void* inp);
+void merge_and_flush(void* p);
+void launch_merge();
 struct file_pair* k_way_merge(int start, int end, int g_id);
-void launch_merge(void* tmp);
+void binary_merge(void* inp);
 
 // locks
 void locks_init();
 void locks_destroy();
 
+// fence pointer functions
+void build_fence(struct entry* data, int l, int r);
+int search_fences(int key, int l, int r);
+
+// reads
+int get(int key);
 
 
 
+int search_fences(int key, int l, int r) {
 
+    return 0;
+}
 
 void locks_init() { 
 
@@ -146,6 +160,12 @@ void locks_init() {
     if (pthread_rwlock_init(&rwlock, NULL) != 0) { 
         printf("\nError: rwlock init failed\n"); 
         exit(1); 
+    } 
+
+    // mutex lock to manage access to the levels metadata
+    if (pthread_mutex_init(&level_table_lock, NULL) != 0) { 
+        printf("\nError: mutex init failed\n"); 
+        return ; 
     } 
 
     int n = SZ_RATIO;
@@ -166,7 +186,7 @@ void locks_init() {
             printf("\nError: mutex init failed\n"); 
             return ; 
         }  
-    } 
+    }
 }
 
 // This function initializes metadata for each level in the LSM tree according to 
@@ -178,7 +198,7 @@ void levels_init() {
     NUM_LEVELS = (int) ceil(log((((double) MAX_MEM) / ((double) M_BUFFER)) * 
                 (((double) (SZ_RATIO-1)) / ((double) SZ_RATIO))) / log(SZ_RATIO));
 
-    levels = (struct levels*) malloc(sizeof(level) * NUM_LEVELS);
+    levels = (struct level*) malloc(sizeof(struct level) * NUM_LEVELS);
 
     // user supplies bits per entry for level 1 (L1_BPE)
     double p1 = exp(-L1_BPE * pow(log(2),2));
@@ -186,7 +206,6 @@ void levels_init() {
     int filtered_levels =  (int) floor((((double) L1_BPE) * pow(log(2),2)) / (log(SZ_RATIO)));
     int bits_per_entry;
     int num_hash;
-    int entries_per_run;
     // int extra;
 
     // below loop is just for a tiering policy, allocates SZ_RATIO runs
@@ -194,35 +213,39 @@ void levels_init() {
     // User should indicate what type of policy to use in each level (maybe via some kind of struct). 
     for(int i = 0; i < NUM_LEVELS; i++) {
 
-        levels[i]->runs = (struct run*) malloc(sizeof(run) * SZ_RATIO);
-        levels[i]->run_cnt = 0;
-        levels[i]->entries_per_run = (L0->length * pow(SZ_RATIO, i));
+        bits_per_entry = (int) ceil(-log(pow(SZ_RATIO, i) * p1) / pow(log(2),2));
+        num_hash = (int) ceil(((double) bits_per_entry) * log(2));
+
+        levels[i].bits_per_entry = bits_per_entry;
+        levels[i].num_hash = num_hash;
+        levels[i].runs = (struct run*) malloc(sizeof(struct run) * SZ_RATIO);
+        levels[i].run_cnt = 0;
+        levels[i].entries_per_run = (int) (L0->length * pow(SZ_RATIO, i));
 
         if(i < filtered_levels) {
             for(int j = 0; j < SZ_RATIO; j++) {
                 // set size of bloom filter based on optimization in Monkey
-                bits_per_entry = (int) ceil(-log(pow(SZ_RATIO, i) * p1) / pow(log(2),2));
-                num_hash = (int) ceil(((double) bits_per_entry) * log(2));
                 
                 // if there are remainder bits, then add an extra byte 
                 // extra = (((M_BUFFER * pow(SZ_RATIO, i)) * bits_per_entry) % 8 == 0 ? 0 : 1);
 
-                levels[i]->runs[j]->file = NULL;
-                levels[i]->runs[j]->num_hash = num_hash;
-                levels[i]->runs[j]->bits_per_entry = bits_per_entry;
+                // levels[i]->runs[j]->file = NULL;
+                // levels[i]->runs[j]->num_hash = num_hash;
+                // levels[i]->runs[j]->bits_per_entry = bits_per_entry;
                 // levels[i]->runs[j]->bloom = (char*) malloc((((M_BUFFER * pow(SZ_RATIO, i)) * bits_per_entry) / 8) + extra);
-                levels[i]->runs[j]->bloom = (char*) malloc((levels[i]->entries_per_run * bits_per_entry) / 8);
-                levels[i]->runs[j]->fences = (struct fence*) malloc(sizeof(struct fence) * 
+                // allocate and initialize bloom_f to zeroes
+                levels[i].runs[j].bloom = (char*) calloc((levels[i].entries_per_run * bits_per_entry) / 8, 1);
+                levels[i].runs[j].fences = (struct fence*) malloc(sizeof(struct fence) * 
                                             ((M_BUFFER * pow(SZ_RATIO, i)) / PAGE_SZ) );
             }
         } else {
             for(int j = 0; j < SZ_RATIO; j++) {
 
-                levels[i]->runs[j]->file = NULL;
-                levels[i]->runs[j]->bits_per_entry = 0;
-                levels[i]->runs[j]->num_hash = 0;
-                levels[i]->runs[j]->bloom = NULL;
-                levels[i]->runs[j]->fences = (struct fence*) malloc(sizeof(struct fence) * 
+                // levels[i]->runs[j]->file = NULL;
+                // levels[i]->runs[j]->bits_per_entry = 0;
+                // levels[i]->runs[j]->num_hash = 0;
+                levels[i].runs[j].bloom = NULL; // no allocation of bloom_f for unfiltered levels
+                levels[i].runs[j].fences = (struct fence*) malloc(sizeof(struct fence) * 
                                             ((M_BUFFER * pow(SZ_RATIO, i)) / PAGE_SZ) );
             }
         }
@@ -233,17 +256,17 @@ void levels_init() {
 // From "Less Hashing, Same Performance: Building a Better Bloom Filter Adam Kirsch, Michael Mitzenmacher"
 // http://citeseerx.ist.psu.edu/viewdoc/download;jsessionid=95B8140B9772E2DDB24199DA24DE5DB1?doi=10.1.1.152.579&rep=rep1&type=pdf
 // gi(x) = h1(x) + ih2(x)
-void bloom_set(int key, int i, int j) {
+void bloom_set(int key, int l, int r) {
 
     uint64_t out[2];
-    int h = levels[i]->runs[j]->num_hash;
-    int n = levels[i]->entries_per_run;
-    int b = levels[i]->runs[j]->bits_per_entry;
+    int h = levels[l].num_hash;
+    int n = levels[l].entries_per_run;
+    int b = levels[l].bits_per_entry;
 
     MurmurHash3_x64_128(&key, sizeof(int), 0, &out);
 
     for(int i = 0; i < h; i++) {
-        SetBit(levels[i]->runs[j]->bloom, ((out[0] + i * out[1]) % (n * b)));
+        SetBit(levels[l].runs[r].bloom, ((out[0] + i * out[1]) % (n * b)));
     } 
 }
 
@@ -251,14 +274,14 @@ void bloom_set(int key, int i, int j) {
 bool bloom_test(int key, int i, int j) {
 
     uint64_t out[2];
-    int h = levels[i]->runs[j]->num_hash;
-    int n = levels[i]->entries_per_run;
-    int b = levels[i]->runs[j]->bits_per_entry;
+    int h = levels[i].num_hash;
+    int n = levels[i].entries_per_run;
+    int b = levels[i].bits_per_entry;
 
     MurmurHash3_x64_128(&key, sizeof(int), 0, &out);
 
     for(int i = 0; i < h; i++) {
-        if(!TestBit(levels[i]->runs[j]->bloom, ((out[0] + i * out[1]) % (n * b)))) {
+        if(!TestBit(levels[i].runs[j].bloom, ((out[0] + i * out[1]) % (n * b)))) {
             return false;
         }
     }
@@ -267,42 +290,51 @@ bool bloom_test(int key, int i, int j) {
 }
 
 
-void build_filter(int* arr, char* bloom, int num_hash) {
+void build_fence(struct entry* data, int l, int r) {
 
-    for(int i = 0; i < num_entries; i++) {
-         bloom_set(bloom, arr[i], num_hash);
+    memset(levels[l].runs[0].fences, 0, sizeof(struct fence) * ((M_BUFFER * pow(SZ_RATIO, l)) / PAGE_SZ));
+
+}
+
+void build_filter(struct entry* data, int l, int r) {
+
+    int n = levels[l].entries_per_run;
+    int b = levels[l].bits_per_entry;
+
+    memset(levels[l].runs[r].bloom, 0, ((n * b) / 8));
+
+    for(int i = 0; i < n; i++) {
+         bloom_set(data[i].key, l, r);
     }
 }
 
+    // double x = ceil(bits_per_entry * log(2));
+    // x = x + 0.5 - (x<0); // x is now 55.499999...
+    // int num_hash = (int) x; // truncated to 55
+    // // printf("num_hashes%d\n", num_hash);
+    // int* arr = (int*) malloc(sizeof(int) * num_entries);
+    // for(int i = 0; i < num_entries; i++) {
+    //     arr[i] = i;
+    // }
+
+    // char* bloom = (char*) malloc((num_entries * bits_per_entry) / 8); 
+    // build_filter(arr, bloom, num_hash);
 
 
-    double x = ceil(bits_per_entry * log(2));
-    x = x + 0.5 - (x<0); // x is now 55.499999...
-    int num_hash = (int) x; // truncated to 55
-    // printf("num_hashes%d\n", num_hash);
-    int* arr = (int*) malloc(sizeof(int) * num_entries);
-    for(int i = 0; i < num_entries; i++) {
-        arr[i] = i;
-    }
+    // srand(time(NULL));
+    // int fp_cnt = 0;
+    // int a;
+    // for(int i = 0; i < num_entries; i++) {
+    //     a = rand();
+    //     if(bloom_test(bloom, a, num_hash)) {
+    //         if(a >= num_entries) {
+    //             printf("FP : %d\n", a);
+    //             fp_cnt++;
+    //         }
+    //     }
+    // }
 
-    char* bloom = (char*) malloc((num_entries * bits_per_entry) / 8); 
-    build_filter(arr, bloom, num_hash);
-
-
-    srand(time(NULL));
-    int fp_cnt = 0;
-    int a;
-    for(int i = 0; i < num_entries; i++) {
-        a = rand();
-        if(bloom_test(bloom, a, num_hash)) {
-            if(a >= num_entries) {
-                printf("FP : %d\n", a);
-                fp_cnt++;
-            }
-        }
-    }
-
-    printf("\n\n FPR : %.9lf\n", ((double) fp_cnt) / ((double) num_entries));
+    // printf("\n\n FPR : %.9lf\n", ((double) fp_cnt) / ((double) num_entries));
 
 // write-optimized buffer...insert O(1) (average case), delete O(lgn), but reads (search) is O(n)
 void buffer_init() {
@@ -326,11 +358,15 @@ int comparator(const void* e1, const void* e2) {
 } 
 
 
-
+// TODO : make sure you don't flush the buffer while a merge is happening on
+// level 0. Level 0 will be full so any flushing will overwrite
 void buffer_flush() {
 
-    char filename[256];
-    sprintf(filename, "level_0_run%d.bin", level[0]->run_cnt);
+    // Wait if level 0 is full. Needs to be merged and flushed so levels[0]->run_cnt will == 0.
+    while(levels[0].run_cnt == SZ_RATIO) {}
+
+    char filename[32];
+    sprintf(filename, "data/file_%d_%d.bin", 0, levels[0].run_cnt);
 
     FILE* fp = fopen(filename , "wb");
     if(!fp) {
@@ -343,57 +379,36 @@ void buffer_flush() {
     fwrite(L0->data + 1, sizeof(struct entry), L0->length, fp);
     fclose(fp);
 
-    // write lock the levels[0] table here
-    levels[0]->run_cnt++;
-    // write unlock the levels[0] table here
+    pthread_rwlock_wrlock(&rwlock);
+    // pthread_mutex_lock(&level_table_lock); 
+    levels[0].run_cnt++;
+    // pthread_mutex_unlock(&level_table_lock); 
+    pthread_rwlock_unlock(&rwlock);
+
     L0->heap_size = 0;
 
     // launch merge/flush on separate thread so it happens in background
-    int p = 0;
-    threadpool_add(pool, merge_and_flush, (void*) &p , 1);
-    // merge_and_flush(0);
+    curr_merge_lev = 0;
+    threadpool_add(pool, merge_and_flush, (void*) &curr_merge_lev , 1);
 }
 
 
 void merge_and_flush(void* p) {
     
-    int i = *((int*) p);
-    // only flush to disk if num_files in level i == SZ_RATIO
-    if(levels[i]->run_cnt < SZ_RATIO) {
-        return; 
+    // cascading flush to disk if num_files in level i == SZ_RATIO
+    while(1) {
+        if(levels[curr_merge_lev].run_cnt == SZ_RATIO) {
+            merge_filesize = (int) (L0->length * pow(SZ_RATIO, curr_merge_lev));
+            launch_merge();
+            curr_merge_lev++;
+        } else {
+            break;
+        }
     }
-
-    // - get filenames of runs in level i
-    // - sort-merge the runs in level i via external sort
-    // - create new bloom filter and fence pointer array during merge
-    // - write new file to disk
-    // - lock levels table
-    // - remove file names of the runs in level i, memset(0) all the bloom filters in level i
-    // - add a new run in new filename in next level i+1, 
-
-    //     r = level[i+1]->run_cnt
-    //     level[i+1]->runs[r]->filename = new_filename;
-    //     level[i+1]->run_cnt++;
-
-    //     levels[i]->runs[run_cnt]->file = NULL;
-    //     levels[i]->runs[j]->bloom = new_bloom;
-    //     levels[i]->runs[j]->fences = (struct fence*) malloc(sizeof(struct fence) * 
-    //                                 ((M_BUFFER * pow(SZ_RATIO, (i+1))) / PAGE_SZ) );
-
-    // - unlock levels table
-
-    //     merge_and_flush(i+1) // cascade merge/flush
-        
-    static int filesize = 100;
-
-    int tmp = 0;
-    threadpool_add(pool, launch_merge, (void*) &tmp , 1);
-
-    return 0;
 }
 
 
-void launch_merge(void* tmp) {
+void launch_merge() {
 
     // group_len is the maximum number of bits i.e. groups we would need to track
     // g_cnt is the actual number of groups that we track i.e. where bit is 1
@@ -407,7 +422,6 @@ void launch_merge(void* tmp) {
     for(int i = 0; n > 0; i += 2) {
 
         if(n % 2) {
-            printf("curr %d\n",curr );
             groups[i] = curr;
             curr += ((int) pow(2, i/2));
             groups[i+1] = curr;
@@ -435,14 +449,16 @@ void launch_merge(void* tmp) {
 
     while(group_wait != 0) {}
 
-    int level = 3;
-    int run = 4;
+    // int level = 3;
+    // int run = 4;
+    int l = curr_merge_lev;
+    int r = levels[l+1].run_cnt;
     struct file_pair output;
     char newname[32];
 
-    // since SZ_RATIO is maxed at 10, at most 3 groups will be present (3 out of 4 bits turned on)
+    // Since SZ_RATIO is maxed at 10, at most 3 groups will be present (3 out of 4 bits turned on).
     if(g_cnt == 1) {
-        sprintf(newname, "data/file_%d_%d.bin", level, run);
+        sprintf(newname, "data/file_%d_%d.bin", l+1, r);
         rename(outs[0]->out_f, newname);
     
     } else if(g_cnt == 2) {
@@ -452,10 +468,8 @@ void launch_merge(void* tmp) {
         output.group = 0;
         output.f1_size = outs[1]->f1_size + outs[1]->f2_size;
         output.f2_size = outs[0]->f1_size + outs[0]->f2_size;
-        sprintf(output.out_f, "data/file_%d_%d.bin", level, run);
+        sprintf(output.out_f, "data/file_%d_%d.bin", l+1, r);
         binary_merge((void*) &output);
-
-        printf("FINAL FILE %s\n", output.out_f);
     
     } else if(g_cnt == 3) {
 
@@ -464,23 +478,72 @@ void launch_merge(void* tmp) {
         output.group = 0;
         output.f1_size = outs[2]->f1_size + outs[2]->f2_size;
         output.f2_size = outs[1]->f1_size + outs[1]->f2_size;
-        sprintf(output.out_f, "data/intermediate");
+        sprintf(output.out_f, "merge/intermediate");
         binary_merge((void*) &output);
 
-        sprintf(output.f1, "data/intermediate");
+        sprintf(output.f1, "merge/intermediate");
         strcpy(output.f2, outs[0]->out_f);
         output.group = 0;
         output.f1_size = outs[2]->f1_size + outs[2]->f2_size;
         output.f2_size = outs[0]->f1_size + outs[0]->f2_size;
-        sprintf(output.out_f, "data/file_%d_%d.bin", level, run);
+        sprintf(output.out_f, "data/file_%d_%d.bin", l+1, r);
         binary_merge((void*) &output);
     }
 
     // TODO : rwlock write lock the levels table, and delete all old files and intermediate files, update
     // levels metadata
-    // now unlock the rwlock
 
-    return ;
+    // sweep through the final merged file and create the bloom filters and fence pointers for this new run 
+    int out = open(output.out_f, O_RDONLY, S_IRUSR | S_IWUSR);
+    struct entry* m_out = mmap(NULL, levels[l+1].entries_per_run * sizeof(struct entry), 
+                                PROT_READ, MAP_PRIVATE, out, 0);
+    build_filter(m_out, l+1, r);
+    build_fence(m_out, l+1, r);
+
+    // rwlock write lock the levels table, and delete all old files and intermediate files, update
+    // levels metadata so readers see a consistent snapshot of the data
+    pthread_rwlock_wrlock(&rwlock);
+    // pthread_mutex_lock(&level_table_lock); 
+    // levels[l+1]->runs[r]->filename = new_filename; // TODO : probably do not need file as atttribute in run struct
+    levels[l+1].run_cnt++;
+    levels[l].run_cnt = 0;
+    // levels[l]->runs[0]->file = NULL; // TODO : probably do not need file as atttribute in run struct
+    
+    // delete old files 
+    for(int i = 0; i < SZ_RATIO; i++) {
+        sprintf(newname, "data/file_%d_%d.bin", l, i);
+        if(remove(newname)) {
+            printf("Failed to delete file"); 
+        }
+    }
+
+    if(g_cnt == 3) {
+        if(remove("merge/intermediate")) {
+            printf("Failed to delete file"); 
+        }
+    }
+
+    pthread_rwlock_unlock(&rwlock);
+    // pthread_mutex_unlock(&level_table_lock); 
+
+    // - get filenames of runs in level i
+    // - sort-merge the runs in level i via parallel k-way merge
+    // - create new bloom filter and fence pointer array during merge
+    // - write new file to disk
+    // - lock levels table
+    // - remove file names of the runs in level i, memset(0) all the bloom filters in level i
+    // - add a new run in new filename in next level i+1, 
+
+    //     r = level[i+1]->run_cnt
+    //     level[i+1]->runs[r]->filename = new_filename;
+    //     level[i+1]->run_cnt++;
+
+        // levels[i]->runs[run_cnt]->file = NULL;
+        // levels[i]->runs[j]->bloom = new_bloom;
+        // levels[i]->runs[j]->fences = (struct fence*) malloc(sizeof(struct fence) * 
+        //                             ((M_BUFFER * pow(SZ_RATIO, (i+1))) / PAGE_SZ) );
+
+    // - rwlock unlock levels table
 }
 
 
@@ -492,7 +555,7 @@ struct file_pair* k_way_merge(int start, int end, int g_id) {
     if(k < 2) {
         // do nothing, you need at least k=2 files to merge
         struct file_pair* a = (struct file_pair*) malloc(sizeof(struct file_pair) * 1);
-        sprintf(a->out_f, "data/file_%d.bin", start);
+        sprintf(a->out_f, "data/file_%d_%d.bin", curr_merge_lev, start);
         a->group = g_id;
 
         return a;
@@ -505,13 +568,13 @@ struct file_pair* k_way_merge(int start, int end, int g_id) {
     q[ind] = (struct file_pair*) malloc(sizeof(struct file_pair) * (k/2));
 
     for(int i = start; i < end; i+=2) {
-        sprintf(q[ind][p_ind].f1, "data/file_%d.bin", i);
-        sprintf(q[ind][p_ind].f2, "data/file_%d.bin", i+1);
-        sprintf(q[ind][p_ind].out_f, "data/out_%d_%d.bin", i+1, ind);
+        sprintf(q[ind][p_ind].f1, "data/file_%d_%d.bin", curr_merge_lev, i);
+        sprintf(q[ind][p_ind].f2, "data/file_%d_%d.bin", curr_merge_lev, i+1);
+        sprintf(q[ind][p_ind].out_f, "merge/out_%d_%d.bin", i+1, ind);
         q[ind][p_ind].group = g_id;
 
-        q[ind][p_ind].f1_size = filesize;
-        q[ind][p_ind].f2_size = filesize;
+        q[ind][p_ind].f1_size = merge_filesize;
+        q[ind][p_ind].f2_size = merge_filesize;
 
         p_ind++;
     } 
@@ -525,13 +588,13 @@ struct file_pair* k_way_merge(int start, int end, int g_id) {
         q[ind] = (struct file_pair*) malloc(sizeof(struct file_pair) * (k/2));
 
         for(int i = j; i < k; i += 2*j) {
-            sprintf(q[ind][p_ind].f1, "data/out_%d_%d.bin", i + start - 1, ind - 1);
-            sprintf(q[ind][p_ind].f2, "data/out_%d_%d.bin", i + start + j - 1, ind - 1);
-            sprintf(q[ind][p_ind].out_f, "data/out_%d_%d.bin", i + start + j - 1, ind);
+            sprintf(q[ind][p_ind].f1, "merge/out_%d_%d.bin", i + start - 1, ind - 1);
+            sprintf(q[ind][p_ind].f2, "merge/out_%d_%d.bin", i + start + j - 1, ind - 1);
+            sprintf(q[ind][p_ind].out_f, "merge/out_%d_%d.bin", i + start + j - 1, ind);
             q[ind][p_ind].group = g_id;
 
-            q[ind][p_ind].f1_size = filesize * j;
-            q[ind][p_ind].f2_size = filesize * j;
+            q[ind][p_ind].f1_size = merge_filesize * j;
+            q[ind][p_ind].f2_size = merge_filesize * j;
 
             p_ind++;
         }
@@ -566,7 +629,6 @@ void binary_merge(void* inp) {
     int inp_size1 = f_pair.f1_size * sizeof(struct entry);
     int inp_size2 = f_pair.f2_size * sizeof(struct entry);
     int out_size = inp_size1 + inp_size2;
-
 
     int fd1 = open(f_pair.f1, O_RDONLY, S_IRUSR | S_IWUSR);
     int fd2 = open(f_pair.f2, O_RDONLY, S_IRUSR | S_IWUSR);
@@ -610,7 +672,6 @@ void binary_merge(void* inp) {
         k++; 
     } 
   
-
     munmap(m1, inp_size1);
     close(fd1);
     munmap(m2, inp_size2);
@@ -625,19 +686,6 @@ void binary_merge(void* inp) {
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
 int get(int key) {
 
     int val = 0;
@@ -649,7 +697,7 @@ int get(int key) {
     }
     // if not found in buffer, search LSM tree on disk
     for(int i = 0; i < NUM_LEVELS; i++) {
-        for(int j = levels[i]->run_cnt; j > 0; j--) { // Go to most recent run first since it may contain updated keys
+        for(int j = levels[i].run_cnt; j > 0; j--) { // Go to most recent run first since it may contain updated keys
             if(bloom_test(key, i, j)) {
                 if((val = search_fences(key, i, j)) != 0 ) {            
                     return val;
@@ -725,7 +773,7 @@ void buffer_load(char* filename) {
                 case 'g': 
                     q.type = GET;
                     q.inp1 = atoi(strtok(NULL, delims));
-                    get(q.inp1)
+                    get(q.inp1);
                     break; 
                 case 'r': 
                     q.type = RANGE;
@@ -854,6 +902,7 @@ void locks_destroy() {
         pthread_mutex_destroy(&k_locks[i]); 
     }
 
+    pthread_mutex_destroy(&level_table_lock); 
     pthread_mutex_destroy(&group_lock); 
     pthread_rwlock_destroy(&rwlock);
     free(k_locks);
@@ -926,6 +975,7 @@ void locks_destroy() {
 // gcc -Wall -g -O0 -DNDEBUG -pthread lsm.c -o lsm
 // ./lsm -r2 -b32 -ftest.txt -c1
 
+// gcc -Wall -g -O0 -pthread lsm.c threadpool.c -o lsm
 
 
 // heap size : 200010
@@ -1054,7 +1104,7 @@ void locks_destroy() {
 
 
 
-// static int filesize = 10000000;
+// static int merge_filesize = 10000000;
 
 // merge experiments...shows that parallel k-way merge is clearly faster than sequential
 
@@ -1080,7 +1130,7 @@ void locks_destroy() {
 // VNatesh:project vikas$ cd data/
 
 
-
+// M_BUFFER + (12 - M_BUFFER%12)
 
 
 
