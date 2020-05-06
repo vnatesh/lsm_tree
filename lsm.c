@@ -493,11 +493,14 @@ void launch_merge() {
     // TODO : rwlock write lock the levels table, and delete all old files and intermediate files, update
     // levels metadata
 
-    // sweep through the final merged file and create the bloom filters and fence pointers for this new run 
+    // Sweep through the final merged file and create the bloom
+    // filters (only for filtered levels from Monkey) and fence pointers for this new run
     int out = open(output.out_f, O_RDONLY, S_IRUSR | S_IWUSR);
     struct entry* m_out = mmap(NULL, levels[l+1].entries_per_run * sizeof(struct entry), 
                                 PROT_READ, MAP_PRIVATE, out, 0);
-    build_filter(m_out, l+1, r);
+    if(levels[l+1].runs[r].bloom != NULL) {
+        build_filter(m_out, l+1, r);
+    }    
     build_fence(m_out, l+1, r);
 
     // rwlock write lock the levels table, and delete all old files and intermediate files, update
@@ -807,7 +810,7 @@ int main(int argc, char* argv[]) {
                 break;
 
             case 'b':
-                M_BUFFER = strtoull(optarg) * (1 << 20); // convert MB to bytes
+                M_BUFFER = strtoull(optarg, NULL, 10) * (1 << 20); // convert MB to bytes
                 break;
 
             case 'f':
@@ -819,7 +822,7 @@ int main(int argc, char* argv[]) {
                 break;
 
             case 'd':
-                MAX_MEM = strtoull(optarg) * (1 << 20); // convert MB to bytes
+                MAX_MEM = strtoull(optarg, NULL, 10) * (1 << 20); // convert MB to bytes
                 break;
 
             case 'e':
@@ -975,7 +978,7 @@ void locks_destroy() {
 // gcc -Wall -g -O0 -DNDEBUG -pthread lsm.c -o lsm
 // ./lsm -r2 -b32 -ftest.txt -c1
 
-// gcc -Wall -g -O0 -pthread lsm.c threadpool.c -o lsm
+// gcc -Wall -g -O0 -pthread lsm.c threadpool.c MurmurHash3.c -o lsm
 
 
 // heap size : 200010
