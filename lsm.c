@@ -108,6 +108,8 @@ static int* k_wait = NULL;
 static int curr_merge_lev;
 static int merge_filesize;
 
+static bool merge_ready = true;
+
 // locks
 static pthread_mutex_t group_lock;
 static pthread_mutex_t* k_locks;
@@ -147,6 +149,10 @@ int search_fences(int key, int l, int r);
 // reads
 int get(int key);
 
+// level management
+void levels_init();
+void levels_free();
+
 
 
 int search_fences(int key, int l, int r) {
@@ -177,7 +183,6 @@ void locks_init() {
         n /= 2;
     }
 
-    // TODO : move these into main function of lsm.c...build all locks/k_wait beforehand a single time
     k_wait = (int*) malloc(sizeof(int) * g_cnt);
     k_locks = (pthread_mutex_t*) malloc(sizeof(pthread_mutex_t) * g_cnt);
 
@@ -358,6 +363,8 @@ int comparator(const void* e1, const void* e2) {
 } 
 
 
+
+static int flush_cnt = 0;
 // TODO : make sure you don't flush the buffer while a merge is happening on
 // level 0. Level 0 will be full so any flushing will overwrite
 void buffer_flush() {
@@ -387,17 +394,21 @@ void buffer_flush() {
 
     L0->heap_size = 0;
 
-    // launch merge/flush on separate thread so it happens in background
+    
     curr_merge_lev = 0;
-    threadpool_add(pool, merge_and_flush, (void*) &curr_merge_lev , 1);
+    // // launch merge/flush on separate thread so it happens in background
+    // threadpool_add(pool, merge_and_flush, (void*) &curr_merge_lev , 1);
+    merge_and_flush((void*) &curr_merge_lev);
 }
 
 
 void merge_and_flush(void* p) {
-    
+
     // cascading flush to disk if num_files in level i == SZ_RATIO
     while(1) {
         if(levels[curr_merge_lev].run_cnt == SZ_RATIO) {
+            printf("flush round %d\n", flush_cnt);
+            flush_cnt++;
             merge_filesize = (int) (L0->length * pow(SZ_RATIO, curr_merge_lev));
             launch_merge();
             curr_merge_lev++;
@@ -409,7 +420,6 @@ void merge_and_flush(void* p) {
 
 
 void launch_merge() {
-
     // group_len is the maximum number of bits i.e. groups we would need to track
     // g_cnt is the actual number of groups that we track i.e. where bit is 1
     int group_len = (int) (floor(log2(SZ_RATIO)) + 1);
@@ -518,15 +528,22 @@ void launch_merge() {
         if(remove(newname)) {
             printf("Failed to delete file"); 
         }
+        printf("Deleted %s\n", newname);
     }
+
+    pthread_rwlock_unlock(&rwlock);
 
     if(g_cnt == 3) {
         if(remove("merge/intermediate")) {
             printf("Failed to delete file"); 
         }
+        printf("Deleted merge/intermediate\n");
     }
 
-    pthread_rwlock_unlock(&rwlock);
+   char cmd[32];
+   strcpy(cmd, "rm merge/out_*" );
+   system(cmd);
+
     // pthread_mutex_unlock(&level_table_lock); 
 
     // - get filenames of runs in level i
@@ -652,8 +669,11 @@ void binary_merge(void* inp) {
     int j = 0;
     int k = 0;
 
+    printf("%d  %s  %s  %s  \n", curr_merge_lev, f_pair.f1, f_pair.f2, f_pair.out_f);
+
+
     while (i < f_pair.f1_size && j < f_pair.f2_size) {
-        if(m1[i].key <= m2[j].key) { 
+        if(m1[i].key <= m2[j].key) {
             m_out[k] = m1[i];
             i++; 
         } else { 
@@ -662,7 +682,7 @@ void binary_merge(void* inp) {
         } 
         k++; 
     } 
-  
+
     while (i < f_pair.f1_size) {
         m_out[k] = m1[i];
         i++; 
@@ -674,7 +694,7 @@ void binary_merge(void* inp) {
         j++; 
         k++; 
     } 
-  
+
     munmap(m1, inp_size1);
     close(fd1);
     munmap(m2, inp_size2);
@@ -810,7 +830,7 @@ int main(int argc, char* argv[]) {
                 break;
 
             case 'b':
-                M_BUFFER = strtoull(optarg, NULL, 10) * (1 << 20); // convert MB to bytes
+                M_BUFFER = strtoull(optarg, NULL, 10) * (1 << 10); // convert KB to bytes
                 break;
 
             case 'f':
@@ -834,7 +854,7 @@ int main(int argc, char* argv[]) {
                     || optopt == 'd' || optopt == 'e') {
                     fprintf(stderr, "Option -%c requires an argument.\n", optopt);
                     fprintf(stderr, "-r : size ratio\n");
-                    fprintf(stderr, "-b : buffer size (MB)\n");
+                    fprintf(stderr, "-b : buffer size (KB)\n");
                     fprintf(stderr, "-f : static workload filename\n");
                     fprintf(stderr, "-c : # of clients\n");
                     fprintf(stderr, "-d : database size (MB)\n");
@@ -851,9 +871,14 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    //  If there is already data in the data directory, then load 
+    // in the auxilliary bloom/fence data into levels, otherwise levels_init
+    // startup():
+
 
     buffer_init();
     locks_init();
+    levels_init();
     pool = threadpool_create(MAX_THREADS, MAX_QUEUE, 0);
 
 
@@ -868,18 +893,11 @@ int main(int argc, char* argv[]) {
         diff_t = (((end.tv_sec - start.tv_sec)*1000000L
             +end.tv_usec) - start.tv_usec) / (1000000.0);
         printf("new buffer load time: %f\n", diff_t); 
-        printf("\n\n\n\n");
+        // printf("\n\n\n\n");
         // for(int i = 1; i <= L0->heap_size; i++) {
         //     printf("%d : %d : %d\n",L0->data[i].del, L0->data[i].key, L0->data[i].val);
         // }
 
-        gettimeofday (&start, NULL);
-        buffer_qsort();
-        gettimeofday (&end, NULL);
-        diff_t = (((end.tv_sec - start.tv_sec)*1000000L
-            +end.tv_usec) - start.tv_usec) / (1000000.0);
-        printf("buffer qsort time: %f\n", diff_t); 
-        printf("heap size : %d\n", L0->heap_size);
 
         // for(int i = 1; i <= L0->heap_size; i++) {
         //     printf("%d : %d : %d\n",L0->data[i].del, L0->data[i].key, L0->data[i].val);
@@ -888,8 +906,27 @@ int main(int argc, char* argv[]) {
 
     buffer_free();
     locks_destroy();
+    levels_free();
     threadpool_destroy(pool, 1);
+
     return 1;
+}
+
+
+// save levels metadata
+void levels_persist() {
+
+}
+
+void levels_free() {
+    for(int i = 0; i < NUM_LEVELS; i++) {
+        for(int j = 0; j < SZ_RATIO; j++) {
+            free(levels[i].runs[j].bloom);
+            free(levels[i].runs[j].fences);
+        }
+        free(levels[i].runs);
+    }
+    free(levels);
 }
 
 
@@ -913,8 +950,6 @@ void locks_destroy() {
     free(groups);
 }
 
-
-    // memset(bloom_f, 0, N)
     // struct stat sb;
 
     // // int fd = fileno(fp);
@@ -939,10 +974,6 @@ void locks_destroy() {
     // If you find the desired index in on of the block ranges during a read (GET),
     //      read that chunk of the file starting at desired offset 
 
-// void *mmap(void *addr, size_t lengthint " prot ", int " flags ,
-//            int fd, off_t offset);int munmap(void *addr, size_t length);
-
-// int munmap(void *addr, size_t length);
 
     // MAXTHREADS = atoi(argv[1]);
 
@@ -972,13 +1003,9 @@ void locks_destroy() {
 // ./generator --puts 20000 --gets 100 --ranges 100 --deletes 1--gets-misses-ratio 0.1 --gets-skewness 0.2 > b.txt; 
 // mv b.txt ../..; 
 // cd ../..;
-// gcc -Wall -g -O0 -DNDEBUG -pthread lsm_test.c -o lsm_test
-// ./lsm_test b.txt 
-
-// gcc -Wall -g -O0 -DNDEBUG -pthread lsm.c -o lsm
-// ./lsm -r2 -b32 -ftest.txt -c1
 
 // gcc -Wall -g -O0 -pthread lsm.c threadpool.c MurmurHash3.c -o lsm
+// ./lsm -r10 -b4 -ftest_wkload.txt -c1 -d100 -e10
 
 
 // heap size : 200010
@@ -998,8 +1025,7 @@ void locks_destroy() {
 // heap size : 2000010
 
 
-// Need to loptmiize bloom filter allocations per level (Monkey) and use a tiering policy for all levels
-// except the last level where we use leveling (1 run Dotstoevsky)  
+// Need to use a tiering policy for all levels except the last level where we use leveling (1 run Dotstoevsky)  
 
 // Do locking per level or per run...If we do 1 lock per run, then the
 // number of locks is size_ratio * lg(n) (n is the number of entries)
@@ -1011,10 +1037,7 @@ void locks_destroy() {
 // Before deleting unecessary read files, it will check if the rw_lock is being held by any reader threads (pthread_rwlock_rdlock(&rwlock)). 
 // Wait until lock acquired. When we get the lock, delete files that had existed before merge
 
-
 // How do we track disk pages in the database (for fence pointers) if malloc can create blocks of memory that straddle several pages?
-// Can you exaplin the sentence ""
-
 
 // ./generator --puts 200000 --gets 100 --ranges 100 --deletes 10 --gets-misses-ratio 0.1 --gets-skewness 0.2 | sort -R > test.txt
 
@@ -1022,10 +1045,6 @@ void locks_destroy() {
 
 // exit_func():
 //  when user wants to exit, flush bloom filters and fence points to disk as a file in some defined format
-
-
-// startup():
-//  if there is already data in the data directory, then load in the auxilliary bloom/fence data
 
 
 // valgrind --leak-check=yes --track-origins=yes ./diophan
