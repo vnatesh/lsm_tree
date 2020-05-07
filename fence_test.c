@@ -22,7 +22,7 @@
 #define PAGE_SZ 4096
 #define MAXTHREADS 64
 
-static int filesize = 256;
+static int filesize = 131072;
 static int SZ_RATIO = 10;
 
 static struct fence* fences;
@@ -48,9 +48,9 @@ void build_fence(struct entry* data, int l, int r) {
 
     int step = PAGE_SZ / sizeof(struct entry);
 
-    for(int i = 0; i < 256; i+= step) {
-        fences[i].min = data[i].key;
-        fences[i].max = data[i + step - 1].key;
+    for(int i = 0; i < ((sizeof(struct entry) * filesize) / PAGE_SZ); i++) {
+        fences[i].min = data[i*step].key;
+        fences[i].max = data[i*step + step - 1].key;
     }
 }
 
@@ -63,10 +63,11 @@ int search_fences(int key, int l, int r) {
 
     while (left <= right) { 
         int m = left + (right - left) / 2; 
+    printf("man %d\n", m);
+            printf("%d %d\n", fences[m].min, fences[m].max);
 
         if (key >= fences[m].min && 
             key <= fences[m].max) { 
-
             char name[32];
             sprintf(name, "data/file_%d_%d.bin", l, r);
             int fd = open(name, O_RDONLY, S_IRUSR | S_IWUSR);
@@ -78,6 +79,7 @@ int search_fences(int key, int l, int r) {
             // binary search through the page
             while (left_pg <= right_pg) { 
                 int mid = left_pg + (right_pg - left_pg) / 2; 
+                printf("%d\n", page[mid].key);
                 if (page[mid].key == key) {
                     int v = page[mid].val;
                     munmap(page, PAGE_SZ);
@@ -125,12 +127,12 @@ int main(int argc, char* argv[]) {
 
     fences = (struct fence*) malloc(sizeof(struct fence) * ((sizeof(struct entry) * filesize) / PAGE_SZ) );
     build_fence(m_out, 0, 0);
-
-    printf("thhhh %d %d\n", fences[0].min, fences[0].max);
+    printf("%d\n", statbuf.st_size);
+    // printf("thhhh %d %d\n", fences[0].min, fences[0].max);
 
     // search_fences(1880135773, 0,0);
 
-    printf("value is %d\n\n", search_fences(1880135773, 0,0));
+    printf("value is %d\n\n", search_fences(-1066278964, 0,0));
     free(fences);
     munmap(m_out, statbuf.st_size);
     close(out);
