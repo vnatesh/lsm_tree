@@ -42,6 +42,7 @@ struct query {
 struct entry {
     int key;
     int val;
+    int extra;
     bool del;
 };
 
@@ -108,8 +109,6 @@ static int* k_wait = NULL;
 static int curr_merge_lev;
 static int merge_filesize;
 
-static bool merge_ready = true;
-
 // locks
 static pthread_mutex_t group_lock;
 static pthread_mutex_t* k_locks;
@@ -143,7 +142,7 @@ void locks_init();
 void locks_destroy();
 
 // fence pointer functions
-void build_fence(struct entry* data, int l, int r);
+void build_fences(struct entry* data, int l, int r);
 int search_fences(int key, int l, int r);
 
 // reads
@@ -234,24 +233,17 @@ void levels_init() {
                 // if there are remainder bits, then add an extra byte 
                 // extra = (((M_BUFFER * pow(SZ_RATIO, i)) * bits_per_entry) % 8 == 0 ? 0 : 1);
 
-                // levels[i]->runs[j]->file = NULL;
-                // levels[i]->runs[j]->num_hash = num_hash;
-                // levels[i]->runs[j]->bits_per_entry = bits_per_entry;
-                // levels[i]->runs[j]->bloom = (char*) malloc((((M_BUFFER * pow(SZ_RATIO, i)) * bits_per_entry) / 8) + extra);
                 // allocate and initialize bloom_f to zeroes
                 levels[i].runs[j].bloom = (char*) calloc((levels[i].entries_per_run * bits_per_entry) / 8, 1);
                 levels[i].runs[j].fences = (struct fence*) malloc(sizeof(struct fence) * 
-                                            ((M_BUFFER * pow(SZ_RATIO, i)) / PAGE_SZ) );
+                                    ((sizeof(struct entry) * L0->length * pow(SZ_RATIO, i)) / PAGE_SZ) );
             }
         } else {
             for(int j = 0; j < SZ_RATIO; j++) {
 
-                // levels[i]->runs[j]->file = NULL;
-                // levels[i]->runs[j]->bits_per_entry = 0;
-                // levels[i]->runs[j]->num_hash = 0;
                 levels[i].runs[j].bloom = NULL; // no allocation of bloom_f for unfiltered levels
                 levels[i].runs[j].fences = (struct fence*) malloc(sizeof(struct fence) * 
-                                            ((M_BUFFER * pow(SZ_RATIO, i)) / PAGE_SZ) );
+                                    ((sizeof(struct entry) * L0->length * pow(SZ_RATIO, i)) / PAGE_SZ) );
             }
         }
     }
@@ -295,7 +287,7 @@ bool bloom_test(int key, int i, int j) {
 }
 
 
-void build_fence(struct entry* data, int l, int r) {
+void build_fences(struct entry* data, int l, int r) {
 
     memset(levels[l].runs[0].fences, 0, sizeof(struct fence) * ((M_BUFFER * pow(SZ_RATIO, l)) / PAGE_SZ));
 
@@ -305,7 +297,7 @@ void build_filter(struct entry* data, int l, int r) {
 
     int n = levels[l].entries_per_run;
     int b = levels[l].bits_per_entry;
-
+    // reset memory to zeroes in case the filter has been used before
     memset(levels[l].runs[r].bloom, 0, ((n * b) / 8));
 
     for(int i = 0; i < n; i++) {
@@ -372,6 +364,7 @@ void buffer_flush() {
     // Wait if level 0 is full. Needs to be merged and flushed so levels[0]->run_cnt will == 0.
     while(levels[0].run_cnt == SZ_RATIO) {}
 
+    int r = levels[0].run_cnt;
     char filename[32];
     sprintf(filename, "data/file_%d_%d.bin", 0, levels[0].run_cnt);
 
@@ -382,9 +375,14 @@ void buffer_flush() {
     }
 
     qsort((void*) (L0->data + 1), (size_t) L0->heap_size, sizeof(struct entry), comparator);
-
     fwrite(L0->data + 1, sizeof(struct entry), L0->length, fp);
     fclose(fp);
+
+    // build filter/fence for new runs that aren't the last one (SZ_RATIO'th run, since that run would be merged/flushed anyway)
+    if(r != SZ_RATIO - 1) {
+        build_filter(L0->data + 1, 0, r);
+        build_fences(L0->data + 1, 0, r);
+    }
 
     pthread_rwlock_wrlock(&rwlock);
     // pthread_mutex_lock(&level_table_lock); 
@@ -393,8 +391,6 @@ void buffer_flush() {
     pthread_rwlock_unlock(&rwlock);
 
     L0->heap_size = 0;
-
-    
     curr_merge_lev = 0;
     // // launch merge/flush on separate thread so it happens in background
     // threadpool_add(pool, merge_and_flush, (void*) &curr_merge_lev , 1);
@@ -407,7 +403,7 @@ void merge_and_flush(void* p) {
     // cascading flush to disk if num_files in level i == SZ_RATIO
     while(1) {
         if(levels[curr_merge_lev].run_cnt == SZ_RATIO) {
-            printf("flush round %d\n", flush_cnt);
+            // printf("flush round %d\n", flush_cnt);
             flush_cnt++;
             merge_filesize = (int) (L0->length * pow(SZ_RATIO, curr_merge_lev));
             launch_merge();
@@ -511,7 +507,7 @@ void launch_merge() {
     if(levels[l+1].runs[r].bloom != NULL) {
         build_filter(m_out, l+1, r);
     }    
-    build_fence(m_out, l+1, r);
+    build_fences(m_out, l+1, r);
 
     // rwlock write lock the levels table, and delete all old files and intermediate files, update
     // levels metadata so readers see a consistent snapshot of the data
@@ -528,21 +524,24 @@ void launch_merge() {
         if(remove(newname)) {
             printf("Failed to delete file"); 
         }
-        printf("Deleted %s\n", newname);
+        // printf("Deleted %s\n", newname);
     }
 
     pthread_rwlock_unlock(&rwlock);
+
+    munmap(m_out, levels[l+1].entries_per_run * sizeof(struct entry));
+    close(out);
 
     if(g_cnt == 3) {
         if(remove("merge/intermediate")) {
             printf("Failed to delete file"); 
         }
-        printf("Deleted merge/intermediate\n");
+        // printf("Deleted merge/intermediate\n");
     }
 
-   char cmd[32];
-   strcpy(cmd, "rm merge/out_*" );
-   system(cmd);
+    char cmd[32];
+    strcpy(cmd, "rm merge/out_*" );
+    system(cmd);
 
     // pthread_mutex_unlock(&level_table_lock); 
 
@@ -875,7 +874,6 @@ int main(int argc, char* argv[]) {
     // in the auxilliary bloom/fence data into levels, otherwise levels_init
     // startup():
 
-
     buffer_init();
     locks_init();
     levels_init();
@@ -908,6 +906,8 @@ int main(int argc, char* argv[]) {
     locks_destroy();
     levels_free();
     threadpool_destroy(pool, 1);
+
+    // sleep(100);
 
     return 1;
 }
@@ -1006,6 +1006,16 @@ void locks_destroy() {
 
 // gcc -Wall -g -O0 -pthread lsm.c threadpool.c MurmurHash3.c -o lsm
 // ./lsm -r10 -b4 -ftest_wkload.txt -c1 -d100 -e10
+
+// ./lsm -r10 -b1024 -ftest_wkload_32M -c1 -d100 -e10
+
+// ./generator --puts 2000000 --gets-misses-ratio 0.1 --gets-skewness 0.2 > test_wkload_32M.txt; 
+// mv test_wkload_32M.txt ../..; 
+
+// ./generator --puts 20000000 --gets-misses-ratio 0.1 --gets-skewness 0.2 > test_wkload_320M.txt;
+// mv test_wkload_320M.txt ../..; 
+
+// ./lsm -r10 -b4096 -ftest_wkload_320M.txt -c1 -d1000 -e10
 
 
 // heap size : 200010
