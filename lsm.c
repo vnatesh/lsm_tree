@@ -85,19 +85,19 @@ struct file_pair {
 };
 
 
-static const char delims[] = " ";
+// tunable user inputs (knobs)
 static int SZ_RATIO;
 static unsigned long long int M_BUFFER;
 static char* static_workload = NULL;
 static int NUM_CLIENTS;
-
-static struct buffer* L0;
-static struct level* levels;
-
 static unsigned long long int MAX_MEM;
-static int NUM_LEVELS;
 static int L1_BPE;
 
+
+static const char delims[] = " ";
+static struct buffer* L0;
+static struct level* levels;
+static int NUM_LEVELS;
 
 static threadpool_t* pool; // global thread pool
 
@@ -129,7 +129,7 @@ void buffer_flush();
 // bloom filter functions
 void build_filter(struct entry* data, int l, int r);
 void bloom_set(int key, int l, int r);
-bool bloom_test(int key, int i, int j);
+bool bloom_test(int key, int l, int r);
 
 // k-way merge functions
 void merge_and_flush(void* p);
@@ -145,19 +145,17 @@ void locks_destroy();
 void build_fences(struct entry* data, int l, int r);
 int search_fences(int key, int l, int r);
 
+
 // reads
 int get(int key);
 
 // level management
 void levels_init();
 void levels_free();
+void levels_persist();
 
 
 
-int search_fences(int key, int l, int r) {
-
-    return 0;
-}
 
 void locks_init() { 
 
@@ -209,6 +207,7 @@ void levels_init() {
     // get the # of levels for which we assign bloom filters. All levels >= this one will not be given any filters
     int filtered_levels =  (int) floor((((double) L1_BPE) * pow(log(2),2)) / (log(SZ_RATIO)));
     int bits_per_entry;
+    int entries_per_run;
     int num_hash;
     // int extra;
 
@@ -218,32 +217,28 @@ void levels_init() {
     for(int i = 0; i < NUM_LEVELS; i++) {
 
         bits_per_entry = (int) ceil(-log(pow(SZ_RATIO, i) * p1) / pow(log(2),2));
+        entries_per_run = (int) (L0->length * pow(SZ_RATIO, i));
         num_hash = (int) ceil(((double) bits_per_entry) * log(2));
 
         levels[i].bits_per_entry = bits_per_entry;
         levels[i].num_hash = num_hash;
         levels[i].runs = (struct run*) malloc(sizeof(struct run) * SZ_RATIO);
         levels[i].run_cnt = 0;
-        levels[i].entries_per_run = (int) (L0->length * pow(SZ_RATIO, i));
+        levels[i].entries_per_run = entries_per_run;
 
         if(i < filtered_levels) {
             for(int j = 0; j < SZ_RATIO; j++) {
-                // set size of bloom filter based on optimization in Monkey
-                
-                // if there are remainder bits, then add an extra byte 
-                // extra = (((M_BUFFER * pow(SZ_RATIO, i)) * bits_per_entry) % 8 == 0 ? 0 : 1);
-
                 // allocate and initialize bloom_f to zeroes
-                levels[i].runs[j].bloom = (char*) calloc((levels[i].entries_per_run * bits_per_entry) / 8, 1);
+                levels[i].runs[j].bloom = (char*) calloc((entries_per_run * bits_per_entry) / 8, 1);
                 levels[i].runs[j].fences = (struct fence*) malloc(sizeof(struct fence) * 
-                                    ((sizeof(struct entry) * L0->length * pow(SZ_RATIO, i)) / PAGE_SZ) );
+                                    ((sizeof(struct entry) * entries_per_run) / PAGE_SZ) );
             }
         } else {
             for(int j = 0; j < SZ_RATIO; j++) {
 
                 levels[i].runs[j].bloom = NULL; // no allocation of bloom_f for unfiltered levels
                 levels[i].runs[j].fences = (struct fence*) malloc(sizeof(struct fence) * 
-                                    ((sizeof(struct entry) * L0->length * pow(SZ_RATIO, i)) / PAGE_SZ) );
+                                    ((sizeof(struct entry) * entries_per_run) / PAGE_SZ) );
             }
         }
     }
@@ -268,17 +263,22 @@ void bloom_set(int key, int l, int r) {
 }
 
 
-bool bloom_test(int key, int i, int j) {
+bool bloom_test(int key, int l, int r) {
 
     uint64_t out[2];
-    int h = levels[i].num_hash;
-    int n = levels[i].entries_per_run;
-    int b = levels[i].bits_per_entry;
+    int h = levels[l].num_hash;
+    int n = levels[l].entries_per_run;
+    int b = levels[l].bits_per_entry;
 
     MurmurHash3_x64_128(&key, sizeof(int), 0, &out);
-
     for(int i = 0; i < h; i++) {
-        if(!TestBit(levels[i].runs[j].bloom, ((out[0] + i * out[1]) % (n * b)))) {
+
+        if(!TestBit(levels[l].runs[r].bloom, ((out[0] + i * out[1]) % (n * b)))) {
+            // printf("YO %llu\n", ((out[0] + i * out[1]) % (n * b)));
+            // printf("%d %d %d\n",h,n,b );
+            // printf("level %d run %d\n",l,r );
+            // printf("level %d run_cnt %d\n\n", l, levels[l].run_cnt);
+
             return false;
         }
     }
@@ -286,12 +286,6 @@ bool bloom_test(int key, int i, int j) {
     return true;
 }
 
-
-void build_fences(struct entry* data, int l, int r) {
-
-    memset(levels[l].runs[0].fences, 0, sizeof(struct fence) * ((M_BUFFER * pow(SZ_RATIO, l)) / PAGE_SZ));
-
-}
 
 void build_filter(struct entry* data, int l, int r) {
 
@@ -333,6 +327,97 @@ void build_filter(struct entry* data, int l, int r) {
 
     // printf("\n\n FPR : %.9lf\n", ((double) fp_cnt) / ((double) num_entries));
 
+void build_fences(struct entry* data, int l, int r) {
+
+    int step = PAGE_SZ / sizeof(struct entry);
+    printf("FENCE BUILT %d %d\n", l, r);
+    for(int i = 0; i < ((sizeof(struct entry) * levels[l].entries_per_run) / PAGE_SZ); i++) {
+        levels[l].runs[r].fences[i].min = data[i*step].key;
+        levels[l].runs[r].fences[i].max = data[i*step + step - 1].key;
+    }
+    // printf("%d %d\n", levels[l].runs[r].fences[200].min, levels[l].runs[r].fences[200].max);
+
+
+}
+
+// binary search through fence pointers of a run. Return value of associated key if found, otherwise 0.
+int search_fences(int key, int l, int r) {
+
+    printf("key %d\n",key );
+    int left = 0;
+    int right = ((sizeof(struct entry) * L0->length * pow(SZ_RATIO, l)) / PAGE_SZ) - 1;
+
+    while (left <= right) { 
+
+        int m = left + (right - left) / 2; 
+        printf("%d\n",m );
+printf("%d %d\n", levels[l].runs[r].fences[m].min, levels[l].runs[r].fences[m].max);
+
+        if (key >= levels[l].runs[r].fences[m].min && 
+            key <= levels[l].runs[r].fences[m].max) { 
+
+            char name[32];
+            sprintf(name, "data/file_%d_%d.bin", l, r);
+            int fd = open(name, O_RDONLY, S_IRUSR | S_IWUSR);
+            struct entry* page = mmap(NULL, PAGE_SZ, PROT_READ, MAP_PRIVATE, fd, m * PAGE_SZ);
+            int left_pg = 0;
+            int right_pg = (PAGE_SZ / sizeof(struct entry)) - 1;
+
+            // binary search through the page
+            while (left_pg <= right_pg) { 
+                int mid = left_pg + (right_pg - left_pg) / 2; 
+                printf("%d\n", page[mid].key);
+                if (page[mid].key == key) {
+                    int v = page[mid].val;
+                    munmap(page, PAGE_SZ);
+                    close(fd);
+                    return v; 
+                }
+          
+                if (page[mid].key < key) {
+                    left_pg = mid + 1; 
+                } else {
+                    right_pg = mid - 1; 
+                }
+            } 
+
+            munmap(page, PAGE_SZ);
+            close(fd);
+            return 0; 
+        } 
+        
+        if (key > levels[l].runs[r].fences[m].max) {
+            left = m + 1; 
+        } else {
+            right = m - 1; 
+        }
+    } 
+  
+    return 0; 
+} 
+
+// int main(int argc, char* argv[]) {
+
+//     struct stat statbuf;
+//     // int out_size = filesize * sizeof(struct entry);
+//     int out = open("data/file_0_0.bin", O_RDONLY, S_IRUSR | S_IWUSR);
+//     // ftruncate(out, out_size);
+  
+//     if (fstat (out,&statbuf) < 0) {
+//         printf ("fstat error");
+//         return 0;
+//     }
+
+//     struct entry* m_out = mmap(NULL, statbuf.st_size, PROT_READ, MAP_PRIVATE, out, 0);
+//     // struct entry* m_out = mmap(NULL, out_size, PROT_READ | PROT_WRITE, MAP_SHARED, out, 0);
+//     int num_keys = statbuf.st_size  / sizeof(struct entry);
+
+//     build_fences(m_out, l+1, r);
+//     printf("value is %d\n\n", search_fences(-1828563885, 0, 0));
+
+//     return 0;
+// }
+
 // write-optimized buffer...insert O(1) (average case), delete O(lgn), but reads (search) is O(n)
 void buffer_init() {
 
@@ -360,7 +445,6 @@ static int flush_cnt = 0;
 // TODO : make sure you don't flush the buffer while a merge is happening on
 // level 0. Level 0 will be full so any flushing will overwrite
 void buffer_flush() {
-
     // Wait if level 0 is full. Needs to be merged and flushed so levels[0]->run_cnt will == 0.
     while(levels[0].run_cnt == SZ_RATIO) {}
 
@@ -717,11 +801,12 @@ int get(int key) {
             return L0->data[i].val;
         }
     }
+
     // if not found in buffer, search LSM tree on disk
     for(int i = 0; i < NUM_LEVELS; i++) {
-        for(int j = levels[i].run_cnt; j > 0; j--) { // Go to most recent run first since it may contain updated keys
+        for(int j = levels[i].run_cnt - 1; j >= 0; j--) { // Go to most recent run first since it may contain updated keys
             if(bloom_test(key, i, j)) {
-                if((val = search_fences(key, i, j)) != 0 ) {            
+                if((val = search_fences(key, i, j)) != 0 ) {         
                     return val;
                 }
             }
@@ -871,14 +956,13 @@ int main(int argc, char* argv[]) {
     }
 
     //  If there is already data in the data directory, then load 
-    // in the auxilliary bloom/fence data into levels, otherwise levels_init
+    // in the auxilliary bloom/fence data as well as the buffer, otherwise run levels_init
     // startup():
 
     buffer_init();
     locks_init();
     levels_init();
     pool = threadpool_create(MAX_THREADS, MAX_QUEUE, 0);
-
 
     if(static_workload) {
 
@@ -902,21 +986,61 @@ int main(int argc, char* argv[]) {
         // }
     }
 
+    printf("val is %d\n", get(583395422));
+
     buffer_free();
     locks_destroy();
     levels_free();
     threadpool_destroy(pool, 1);
 
     // sleep(100);
-
-    return 1;
+    return 0;
 }
 
 
-// save levels metadata
+// Save the bloom filters and fence pointer arrays in each level to disk
+// Also persist the buffer to disk
 void levels_persist() {
 
+    char filename[32];
+    sprintf(filename, "data/buffer.bin");
+
+    FILE* fp = fopen(filename , "wb");
+    if(!fp) {
+        printf("Error: Could not open file\n");
+        exit(1);
+    }
+
+    fwrite(L0->data + 1, sizeof(struct entry), L0->length, fp);
+    fclose(fp);
+
+    // if not found in buffer, search LSM tree on disk
+    for(int i = 0; i < NUM_LEVELS; i++) {
+        for(int j = 0; j < levels[i].run_cnt; j++) { // Go to most recent run first since it may contain updated keys
+
+            sprintf(filename, "data/bloom/file_%d_%d.bin", i, j);
+            fp = fopen(filename , "wb");
+            if(!fp) {
+                printf("Error: Could not open file\n");
+                exit(1);
+            }
+            fwrite(levels[i].runs[j].bloom , 1, 
+                    (levels[i].entries_per_run * levels[i].bits_per_entry) / 8, fp);
+            fclose(fp);
+
+            sprintf(filename, "data/fence/file_%d_%d.bin", i, j);
+            fp = fopen(filename , "wb");
+            if(!fp) {
+                printf("Error: Could not open file\n");
+                exit(1);
+            }
+            fwrite(levels[i].runs[j].fences , sizeof(struct fence), 
+                    (sizeof(struct entry) * levels[i].entries_per_run) / PAGE_SZ, fp);
+            fclose(fp);
+        }
+    }
 }
+
 
 void levels_free() {
     for(int i = 0; i < NUM_LEVELS; i++) {
@@ -1007,7 +1131,7 @@ void locks_destroy() {
 // gcc -Wall -g -O0 -pthread lsm.c threadpool.c MurmurHash3.c -o lsm
 // ./lsm -r10 -b4 -ftest_wkload.txt -c1 -d100 -e10
 
-// ./lsm -r10 -b1024 -ftest_wkload_32M -c1 -d100 -e10
+// ./lsm -r10 -b1024 -ftest_wkload_32M.txt -c1 -d100 -e10
 
 // ./generator --puts 2000000 --gets-misses-ratio 0.1 --gets-skewness 0.2 > test_wkload_32M.txt; 
 // mv test_wkload_32M.txt ../..; 
@@ -1017,6 +1141,8 @@ void locks_destroy() {
 
 // ./lsm -r10 -b4096 -ftest_wkload_320M.txt -c1 -d1000 -e10
 
+
+// valgrind --leak-check=yes --track-origins=yes ./lsm -r10 -b4 -ftest_wkload.txt -c1 -d100 -e10
 
 // heap size : 200010
 // old buffer load time: 0.019460
