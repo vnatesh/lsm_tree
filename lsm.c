@@ -10,13 +10,20 @@
 #include <errno.h>
 #include <string.h>
 #include <pthread.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/time.h> 
 #include <sys/mman.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/select.h>
 #include <fcntl.h>
+
 #include "threadpool.h"
-#include "MurmurHash3.h"
+// #include "MurmurHash3.h"
+
+#include "xxh3.h"
+
 
 // Tunable constants
 #define PAGE_SZ 4096
@@ -84,6 +91,11 @@ struct file_pair {
     int f2_size;
 };
 
+// keyval type for load command .bin files
+struct keyval {
+    int key;
+    int val;
+};
 
 // tunable user inputs (knobs)
 static int SZ_RATIO;
@@ -100,6 +112,7 @@ static struct level* levels;
 static int NUM_LEVELS;
 
 static threadpool_t* pool; // global thread pool
+static char *socket_path = "ipc_socket";
 
 // global vars for merge threads
 static int g_cnt = 0; // number of merge groups (# of 1's in bin(SZ_RATIO))
@@ -250,34 +263,36 @@ void levels_init() {
 // gi(x) = h1(x) + ih2(x)
 void bloom_set(int key, int l, int r) {
 
-    uint64_t out[2];
+    // uint64_t out[2];
     int h = levels[l].num_hash;
     int n = levels[l].entries_per_run;
     int b = levels[l].bits_per_entry;
 
-    MurmurHash3_x64_128(&key, sizeof(int), 0, &out);
+    // MurmurHash3_x64_128(&key, sizeof(int), 0, &out);
+
+    // XXH64_hash_t out = XXH3(&key, sizeof(int), 0);
+    XXH128_hash_t out = XXH128(&key, sizeof(int), 0);
+
 
     for(int i = 0; i < h; i++) {
-        SetBit(levels[l].runs[r].bloom, ((out[0] + i * out[1]) % (n * b)));
+        // SetBit(levels[l].runs[r].bloom, ((out[0] + i * out[1]) % (n * b)));
+        SetBit(levels[l].runs[r].bloom, ((out.low64 + i * out.high64) % (n * b)));
     } 
 }
 
 
 bool bloom_test(int key, int l, int r) {
 
-    uint64_t out[2];
+    // uint64_t out[2];
     int h = levels[l].num_hash;
     int n = levels[l].entries_per_run;
     int b = levels[l].bits_per_entry;
 
-    MurmurHash3_x64_128(&key, sizeof(int), 0, &out);
+    // MurmurHash3_x64_128(&key, sizeof(int), 0, &out);
+    XXH128_hash_t out = XXH128(&key, sizeof(int), 0);
     for(int i = 0; i < h; i++) {
-
-        if(!TestBit(levels[l].runs[r].bloom, ((out[0] + i * out[1]) % (n * b)))) {
-            // printf("YO %llu\n", ((out[0] + i * out[1]) % (n * b)));
-            // printf("%d %d %d\n",h,n,b );
-            // printf("level %d run %d\n",l,r );
-            // printf("level %d run_cnt %d\n\n", l, levels[l].run_cnt);
+        // if(!TestBit(levels[l].runs[r].bloom, ((out[0] + i * out[1]) % (n * b)))) {
+        if(!TestBit(levels[l].runs[r].bloom, ((out.low64 + i * out.high64) % (n * b)))) {
 
             return false;
         }
@@ -330,28 +345,27 @@ void build_filter(struct entry* data, int l, int r) {
 void build_fences(struct entry* data, int l, int r) {
 
     int step = PAGE_SZ / sizeof(struct entry);
-    printf("FENCE BUILT %d %d\n", l, r);
+
     for(int i = 0; i < ((sizeof(struct entry) * levels[l].entries_per_run) / PAGE_SZ); i++) {
         levels[l].runs[r].fences[i].min = data[i*step].key;
         levels[l].runs[r].fences[i].max = data[i*step + step - 1].key;
     }
     // printf("%d %d\n", levels[l].runs[r].fences[200].min, levels[l].runs[r].fences[200].max);
 
-
 }
 
+
 // binary search through fence pointers of a run. Return value of associated key if found, otherwise 0.
+// TODO : the last fence is wrong since it wont be at a perfect offset of 4096. 
+// TODO : try linear search, see if its faster
 int search_fences(int key, int l, int r) {
 
-    printf("key %d\n",key );
     int left = 0;
     int right = ((sizeof(struct entry) * L0->length * pow(SZ_RATIO, l)) / PAGE_SZ) - 1;
 
     while (left <= right) { 
 
         int m = left + (right - left) / 2; 
-        printf("%d\n",m );
-printf("%d %d\n", levels[l].runs[r].fences[m].min, levels[l].runs[r].fences[m].max);
 
         if (key >= levels[l].runs[r].fences[m].min && 
             key <= levels[l].runs[r].fences[m].max) { 
@@ -365,8 +379,9 @@ printf("%d %d\n", levels[l].runs[r].fences[m].min, levels[l].runs[r].fences[m].m
 
             // binary search through the page
             while (left_pg <= right_pg) { 
+
                 int mid = left_pg + (right_pg - left_pg) / 2; 
-                printf("%d\n", page[mid].key);
+
                 if (page[mid].key == key) {
                     int v = page[mid].val;
                     munmap(page, PAGE_SZ);
@@ -396,27 +411,6 @@ printf("%d %d\n", levels[l].runs[r].fences[m].min, levels[l].runs[r].fences[m].m
     return 0; 
 } 
 
-// int main(int argc, char* argv[]) {
-
-//     struct stat statbuf;
-//     // int out_size = filesize * sizeof(struct entry);
-//     int out = open("data/file_0_0.bin", O_RDONLY, S_IRUSR | S_IWUSR);
-//     // ftruncate(out, out_size);
-  
-//     if (fstat (out,&statbuf) < 0) {
-//         printf ("fstat error");
-//         return 0;
-//     }
-
-//     struct entry* m_out = mmap(NULL, statbuf.st_size, PROT_READ, MAP_PRIVATE, out, 0);
-//     // struct entry* m_out = mmap(NULL, out_size, PROT_READ | PROT_WRITE, MAP_SHARED, out, 0);
-//     int num_keys = statbuf.st_size  / sizeof(struct entry);
-
-//     build_fences(m_out, l+1, r);
-//     printf("value is %d\n\n", search_fences(-1828563885, 0, 0));
-
-//     return 0;
-// }
 
 // write-optimized buffer...insert O(1) (average case), delete O(lgn), but reads (search) is O(n)
 void buffer_init() {
@@ -487,7 +481,6 @@ void merge_and_flush(void* p) {
     // cascading flush to disk if num_files in level i == SZ_RATIO
     while(1) {
         if(levels[curr_merge_lev].run_cnt == SZ_RATIO) {
-            // printf("flush round %d\n", flush_cnt);
             flush_cnt++;
             merge_filesize = (int) (L0->length * pow(SZ_RATIO, curr_merge_lev));
             launch_merge();
@@ -580,9 +573,6 @@ void launch_merge() {
         binary_merge((void*) &output);
     }
 
-    // TODO : rwlock write lock the levels table, and delete all old files and intermediate files, update
-    // levels metadata
-
     // Sweep through the final merged file and create the bloom
     // filters (only for filtered levels from Monkey) and fence pointers for this new run
     int out = open(output.out_f, O_RDONLY, S_IRUSR | S_IWUSR);
@@ -595,12 +585,10 @@ void launch_merge() {
 
     // rwlock write lock the levels table, and delete all old files and intermediate files, update
     // levels metadata so readers see a consistent snapshot of the data
+    // TODO : only lock
     pthread_rwlock_wrlock(&rwlock);
-    // pthread_mutex_lock(&level_table_lock); 
-    // levels[l+1]->runs[r]->filename = new_filename; // TODO : probably do not need file as atttribute in run struct
     levels[l+1].run_cnt++;
     levels[l].run_cnt = 0;
-    // levels[l]->runs[0]->file = NULL; // TODO : probably do not need file as atttribute in run struct
     
     // delete old files 
     for(int i = 0; i < SZ_RATIO; i++) {
@@ -608,7 +596,6 @@ void launch_merge() {
         if(remove(newname)) {
             printf("Failed to delete file"); 
         }
-        // printf("Deleted %s\n", newname);
     }
 
     pthread_rwlock_unlock(&rwlock);
@@ -620,33 +607,11 @@ void launch_merge() {
         if(remove("merge/intermediate")) {
             printf("Failed to delete file"); 
         }
-        // printf("Deleted merge/intermediate\n");
     }
 
     char cmd[32];
     strcpy(cmd, "rm merge/out_*" );
     system(cmd);
-
-    // pthread_mutex_unlock(&level_table_lock); 
-
-    // - get filenames of runs in level i
-    // - sort-merge the runs in level i via parallel k-way merge
-    // - create new bloom filter and fence pointer array during merge
-    // - write new file to disk
-    // - lock levels table
-    // - remove file names of the runs in level i, memset(0) all the bloom filters in level i
-    // - add a new run in new filename in next level i+1, 
-
-    //     r = level[i+1]->run_cnt
-    //     level[i+1]->runs[r]->filename = new_filename;
-    //     level[i+1]->run_cnt++;
-
-        // levels[i]->runs[run_cnt]->file = NULL;
-        // levels[i]->runs[j]->bloom = new_bloom;
-        // levels[i]->runs[j]->fences = (struct fence*) malloc(sizeof(struct fence) * 
-        //                             ((M_BUFFER * pow(SZ_RATIO, (i+1))) / PAGE_SZ) );
-
-    // - rwlock unlock levels table
 }
 
 
@@ -752,9 +717,6 @@ void binary_merge(void* inp) {
     int j = 0;
     int k = 0;
 
-    printf("%d  %s  %s  %s  \n", curr_merge_lev, f_pair.f1, f_pair.f2, f_pair.out_f);
-
-
     while (i < f_pair.f1_size && j < f_pair.f2_size) {
         if(m1[i].key <= m2[j].key) {
             m_out[k] = m1[i];
@@ -789,7 +751,6 @@ void binary_merge(void* inp) {
     k_wait[f_pair.group]--;
     pthread_mutex_unlock(&k_locks[f_pair.group]); 
 }
-
 
 
 int get(int key) {
@@ -963,6 +924,7 @@ int main(int argc, char* argv[]) {
     locks_init();
     levels_init();
     pool = threadpool_create(MAX_THREADS, MAX_QUEUE, 0);
+    run_server();
 
     if(static_workload) {
 
@@ -986,7 +948,44 @@ int main(int argc, char* argv[]) {
         // }
     }
 
-    printf("val is %d\n", get(583395422));
+
+    gettimeofday (&start, NULL);
+
+
+    char line[31];
+    FILE *fp = fopen("test_wkload_32M.txt", "r");
+    char* a;
+
+    struct query q;
+
+    while(fgets(line, sizeof(line), fp) != NULL) {
+
+        if(line[0] != '\n') {
+
+            a = strtok(line, delims);
+
+            switch(a[0]) {
+                case 'p': 
+                    q.type = PUT;
+                    q.inp1 = atoi(strtok(NULL, delims));
+                    q.inp2 = atoi(strtok(NULL, delims));
+                    printf("%d  %d\n",q.inp1,get(q.inp1));
+                    break;
+                default: 
+                    printf("Error : Invalid Command"); 
+                    exit(1);
+            }   
+        }
+    }
+
+    fclose(fp);
+
+    // printf("get is %d\n",get(730962444));
+    gettimeofday (&end, NULL);
+    diff_t = (((end.tv_sec - start.tv_sec)*1000000L
+        +end.tv_usec) - start.tv_usec) / (1000000.0);
+    printf("Read time: %f\n", diff_t); 
+
 
     buffer_free();
     locks_destroy();
@@ -995,6 +994,157 @@ int main(int argc, char* argv[]) {
 
     // sleep(100);
     return 0;
+}
+
+
+void run_server() {
+
+    struct sockaddr_un addr;
+    int client_fd;
+    int socket_fd;
+
+    if ( (socket_fd = socket(AF_UNIX, SOCK_STREAM, 0)) == -1) {
+        perror("socket error");
+        exit(-1);
+    }
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    
+    if (*socket_path == '\0') {
+        *addr.sun_path = '\0';
+        strncpy(addr.sun_path+1, socket_path+1, sizeof(addr.sun_path)-2);
+    } else {
+        strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path)-1);
+        unlink(socket_path);
+    }
+
+    if (bind(socket_fd, (struct sockaddr*) &addr, sizeof(addr)) == -1) {
+        perror("bind error");
+        exit(-1);
+    }
+
+    // TODO : experiment with backlog (queue) value...change from 5 to 10 or 32...
+    if (listen(socket_fd, 5) == -1) {
+        perror("listen error");
+        exit(-1);
+    }
+
+    while (1) {
+        if ( (client_fd = accept(socket_fd, NULL, NULL)) == -1) {
+            perror("accept error");
+            continue;
+        }
+
+        threadpool_add(pool, client_handler, (void*) &client_fd , 1);
+    }
+
+    return 0;
+}
+
+
+
+// load queries statically from a file
+// TODO : change buffer_load to this function to handle load command .bin files
+void buffer_load(char* filename) {
+
+    struct query q;
+    struct stat statbuf;
+    int fd = open(filename, O_RDONLY, S_IRUSR | S_IWUSR);
+  
+    if (fstat (fd, &statbuf) < 0) {
+        printf ("fstat error");
+        return 0;
+    }
+
+    struct keyval* m_out = mmap(NULL, statbuf.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    int num_entries = statbuf.st_size  / sizeof(struct keyval);
+
+    for(int i = 0; i < num_entries; i++) {
+
+        if(L0->heap_size == L0->length) {
+            buffer_flush();  
+        } else {
+            q.type = PUT;
+            q.inp1 = m_out[i].val;
+            q.inp2 = m_out[i].val;
+            buffer_insert(q);
+        }        
+    }
+
+    munmap(m_out, statbuf.st_size);
+    close(out)
+}
+
+
+void client_handler(void* client) {
+
+    int client_fd = *((int*) client);
+    int rc;
+    char line[31];
+    char* a;
+    struct query q;
+
+    char val[15];
+    // char* buf = (char*) malloc(sizeof(struct entry) * );
+    // while ((rc = read(client_fd,buf, sizeof(buf))) > 0) {
+    //     printf("read %u bytes: %.*s\n", rc, rc, buf);
+    // }
+
+    while ((rc = read(client_fd, line, sizeof(line))) > 0) {
+
+        if(L0->heap_size == L0->length) {
+            buffer_flush();  
+        }
+
+        if(line[0] != '\n') {
+
+            a = strtok(line, delims);
+
+            switch(a[0]) {
+                case 'p': 
+                    q.type = PUT;
+                    q.inp1 = atoi(strtok(NULL, delims));
+                    q.inp2 = atoi(strtok(NULL, delims));
+                    pthread_rwlock_wrlock(&rwlock);
+                    buffer_insert(q);
+                    pthread_rwlock_unlock(&rwlock);
+                    break;
+                case 'd': 
+                    q.type = DELETE;
+                    q.inp1 = atoi(strtok(NULL, delims));
+                    pthread_rwlock_wrlock(&rwlock);
+                    buffer_insert(q);
+                    pthread_rwlock_unlock(&rwlock);
+                    break;
+                case 'g': 
+                    q.type = GET;
+                    q.inp1 = atoi(strtok(NULL, delims));
+                    pthread_rwlock_rdlock(&rwlock);
+                    itoa(get(q.inp1), val, 10);
+                    pthread_rwlock_unlock(&rwlock);
+                    write(client_fd, val, nread);
+                    break; 
+                case 'r': 
+                    q.type = RANGE;
+                    q.inp1 = atoi(strtok(NULL, delims));
+                    q.inp2 = atoi(strtok(NULL, delims));
+                    pthread_rwlock_rdlock(&rwlock);
+                    // range() // TODO : range query
+                    pthread_rwlock_unlock(&rwlock);
+                    break; 
+                // case 's':
+                case 'l':
+                    buffer_load(static_workload);
+                    break;
+                default: 
+                    printf("Error : Invalid Command"); 
+                    exit(1);
+            }   
+        }
+    }
+
+    close(client_fd);
 }
 
 
@@ -1123,6 +1273,18 @@ void locks_destroy() {
 // ********************* NOTES ***********************
 
 
+// // Future optimizations:
+
+// Currently, the entry size is 16 bytes instead of 8 bytes due to the delete bit and the extra bits fegnrelghjrjhgirgkrjgiorjgioerjgoir
+// allocated for alignment. However, in the future it would be better to only store the delete bit in the 
+// first level on disk. The sort/merge/delete process will ensure that all greater levels only need the key and
+// val, allowing an entry in these levels to only need 8 bytes. This would reduce the total memory by ~ 50% 
+// and improve read/merge throughput. 
+
+
+// A parallel k-way merge algorithm was used to improve merge performance. In this algorithm, the merging of files within a level
+// happens in parallel 
+
 // cd cs265-sysproj/generator/; 
 // ./generator --puts 20000 --gets 100 --ranges 100 --deletes 1--gets-misses-ratio 0.1 --gets-skewness 0.2 > b.txt; 
 // mv b.txt ../..; 
@@ -1140,6 +1302,11 @@ void locks_destroy() {
 // mv test_wkload_320M.txt ../..; 
 
 // ./lsm -r10 -b4096 -ftest_wkload_320M.txt -c1 -d1000 -e10
+
+
+
+// gcc -Wall -g -O0 -pthread lsm.c threadpool.c -o lsm
+// ./lsm -r10 -b1024 -ftest_wkload_32M.txt -c1 -d100 -e10
 
 
 // valgrind --leak-check=yes --track-origins=yes ./lsm -r10 -b4 -ftest_wkload.txt -c1 -d100 -e10
@@ -1243,7 +1410,8 @@ void locks_destroy() {
 
 
 // M_buffer = P * B * E
-// where B is the number of entries that fit into a disk page, P is the amount of main memory in terms of disk pages allocated to the buffer, and E is the average size of data entries
+// where B is the number of entries that fit into a disk page, P is the amount of main memory in terms of disk
+// pages allocated to the buffer, and E is the average size of data entries
 
 // In our dataset, all entries are of equal size i.e.
 
@@ -1289,6 +1457,75 @@ void locks_destroy() {
 
 
 // M_BUFFER + (12 - M_BUFFER%12)
+
+
+// The final report will be due on May 11 at noon (grades are due on May 12). Submission by PDF on Canvas. 
+// (due date was May 9 but we are moving it to May 11).
+
+// For your final reports, you should follow the instructions and template/format of the midway checkin report. 
+
+// Systems projects meetings will be focused 50% on code review and 50% on discussion on optimization and analysis 
+// of experimental results. 
+
+
+
+
+
+
+
+
+
+
+// The following are the deliverables for midway check-in:
+
+ 
+
+// Report: Your report should describe in detail the intended design of the first phase of the project, i.e, 
+// you do not have to include concurrent execution. You may start with an overview of the design considerations 
+// that you’ve made so far. For each design decision, you may specify (a) the intuition behind decision in the 
+// first place, (b) a description of the design elements involved, and c) for the parts that are already 
+// implemented you should describe the implementation at a high level. ​Additionally, you can include deeper
+//  details with supporting materials such as, architecture diagrams, flowcharts, and/or pseudocode for 
+//  clarification. This is optional for the midway check-in but including such graphics will allow us to 
+//  give better feedback that will help you with the final report. 
+
+ 
+
+// The report should contain at least two performance experiments (e.g., reporting response time) that 
+// demonstrate an unoptimized variant of a get and a put operation. For e.g., the get operator does not
+//  need to  have the bloom filter optimization proposed in Monkey. Ideally for each performance graph 
+//  you can already have an additional graph that helps explain the results (e.g., you can count the 
+//     number of I/O operations). 
+
+ 
+
+// The document should be a maximum of 3 pages organized using the same template as of the final report 
+// (but a shorter version): http://daslab.seas.harvard.edu/classes/cs265/files/Final_Report_Template.pdf. 
+// You should format the document using a 10pt font, 1 inch margin using the latex template that can be
+//  found at the ACM website: https://www.acm.org/publications/proceedings-template. You should submit a pdf through canvas. 
+
+ 
+
+// This report will effectively be the starting point for your final end-of-semester report. 
+
+ 
+
+// The report for the midway check-in will be due on March 12. There will be an entry on Canvas to submit 
+// a PDF. This will give you some time to fine-tune your report after getting some feedback during your 
+// code review meeting. 
+
+ 
+
+// Code Review: Each student should sign up for a code review meeting here. Your goal for the code r
+// eview meeting is to give a demo of your project so far, and in particular of the two working 
+// operations. It is an opportunity to get feedback on both the design and the structure of your 
+// code. During the meeting we will also “debug” your performance graphs. That is, you should be 
+// ready to reproduce them, run variations of your scripts, and explain the results. This is an 
+// opportunity for us to give you feedback on how to do good performance analysis graphs so you
+//  can obtain good standards for your final report. 
+
+
+
 
 
 
