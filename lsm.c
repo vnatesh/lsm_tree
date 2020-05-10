@@ -18,6 +18,7 @@
 #include <sys/stat.h>
 #include <sys/select.h>
 #include <fcntl.h>
+#include <dirent.h>
 
 #include "threadpool.h"
 // #include "MurmurHash3.h"
@@ -72,6 +73,7 @@ struct run {
     // int num_hash;
 };
 
+// let run 0 be the active run for lazy leveling
 struct level {
     struct run* runs;
     int run_cnt;
@@ -105,7 +107,6 @@ static int NUM_CLIENTS;
 static unsigned long long int MAX_MEM;
 static int L1_BPE;
 
-
 static const char delims[] = " ";
 static struct buffer* L0;
 static struct level* levels;
@@ -113,6 +114,7 @@ static int NUM_LEVELS;
 
 static threadpool_t* pool; // global thread pool
 static char *socket_path = "ipc_socket";
+// static char* data_dir = "data";
 
 // global vars for merge threads
 static int g_cnt = 0; // number of merge groups (# of 1's in bin(SZ_RATIO))
@@ -127,7 +129,6 @@ static pthread_mutex_t group_lock;
 static pthread_mutex_t* k_locks;
 static pthread_rwlock_t rwlock;
 static pthread_mutex_t level_table_lock;
-
 
 // L0 buffer functions
 void buffer_init();
@@ -158,7 +159,6 @@ void locks_destroy();
 void build_fences(struct entry* data, int l, int r);
 int search_fences(int key, int l, int r);
 
-
 // reads
 int get(int key);
 
@@ -166,8 +166,11 @@ int get(int key);
 void levels_init();
 void levels_free();
 void levels_persist();
+void levels_load();
 
-
+// client/server
+void client_handler(void* client);
+void run_server();
 
 
 void locks_init() { 
@@ -208,6 +211,14 @@ void locks_init() {
 // user defined policies (leveling, tiering, lazy leveling). It also implements the 
 // Monkey optimizations for bloom filters
 // TODO : need to support leveling, tiering, or lazy-leveling policies for merge in each level
+
+// K =1 andZ = 1 give leveling
+// K = T −1 and Z = T −1 give tiering
+// K = T −1 and Z = 1 give Lazy Leveling
+
+// static int K;
+// static int Z;
+
 void levels_init() {
     // L = ln((N*E / M_BUF) * ((T-1) / T)) / ln(T)
     NUM_LEVELS = (int) ceil(log((((double) MAX_MEM) / ((double) M_BUFFER)) * 
@@ -807,16 +818,136 @@ void buffer_insert(struct query q) {
 }
 
 
+// // load queries statically from a file
+// void buffer_load(char* filename) {
+
+//     char line[31];
+//     FILE *fp = fopen(filename, "r");
+//     char* a;
+
+//     struct query q;
+
+//     while(fgets(line, sizeof(line), fp) != NULL) {
+
+//         if(L0->heap_size == L0->length) {
+//             buffer_flush();  
+//         }
+
+//         if(line[0] != '\n') {
+
+//             a = strtok(line, delims);
+
+//             switch(a[0]) {
+//                 case 'p': 
+//                     q.type = PUT;
+//                     q.inp1 = atoi(strtok(NULL, delims));
+//                     q.inp2 = atoi(strtok(NULL, delims));
+//                     buffer_insert(q);
+//                     break;
+//                 case 'd': 
+//                     q.type = DELETE;
+//                     q.inp1 = atoi(strtok(NULL, delims));
+//                     buffer_insert(q);
+//                     break;
+//                 case 'g': 
+//                     q.type = GET;
+//                     q.inp1 = atoi(strtok(NULL, delims));
+//                     get(q.inp1);
+//                     break; 
+//                 case 'r': 
+//                     q.type = RANGE;
+//                     q.inp1 = atoi(strtok(NULL, delims));
+//                     q.inp2 = atoi(strtok(NULL, delims));
+//                     break; 
+//                 // case 's':
+//                 // case 'l':
+//                 default: 
+//                     printf("Error : Invalid Command"); 
+//                     exit(1);
+//             }   
+//         }
+//     }
+
+//     fclose(fp);
+// }
+
+
 // load queries statically from a file
+// TODO : change buffer_load to this function to handle load command .bin files
 void buffer_load(char* filename) {
 
-    char line[31];
-    FILE *fp = fopen(filename, "r");
-    char* a;
-
     struct query q;
+    struct stat statbuf;
+    int fd = open(filename, O_RDONLY, S_IRUSR | S_IWUSR);
+  
+    if (fstat (fd, &statbuf) < 0) {
+        printf ("fstat error");
+        return ;
+    }
 
-    while(fgets(line, sizeof(line), fp) != NULL) {
+    struct keyval* m_out = mmap(NULL, statbuf.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    int num_entries = statbuf.st_size  / sizeof(struct keyval);
+
+    for(int i = 0; i < num_entries; i++) {
+
+        if(L0->heap_size == L0->length) {
+            buffer_flush();  
+        } else {
+            q.type = PUT;
+            q.inp1 = m_out[i].val;
+            q.inp2 = m_out[i].val;
+            buffer_insert(q);
+        }        
+    }
+
+    munmap(m_out, statbuf.st_size);
+    close(fd);
+}
+
+
+void client_handler(void* client) {
+
+    int client_fd = *((int*) client);
+    int rc;
+    char line[31];
+    char* a;
+    struct query q;
+    char val[15];
+
+    int sret = 0;
+    struct timeval timeout;
+    fd_set readfds;
+
+    // char* buf = (char*) malloc(sizeof(struct entry) * );
+    // while ((rc = read(client_fd,buf, sizeof(buf))) > 0) {
+    //     printf("read %u bytes: %.*s\n", rc, rc, buf);
+    // }
+
+    while (1) {
+
+        FD_ZERO(&readfds);
+        FD_SET(client_fd, &readfds);
+        timeout.tv_sec = 1;
+        timeout.tv_usec = 0;
+        sret = select(client_fd + 1, &readfds, NULL, NULL, &timeout);
+
+        if(sret == 0) {
+            printf("1 sec timeout exceeded. Client with fd = %d will be closed \n", client_fd);
+            break;
+        
+        } else {
+            // if ((rc = recv(client_fd, line, sizeof(line), 0)) == -1) {
+            if ((rc = read(client_fd, line, sizeof(line))) == -1) {
+                perror("recv");
+                exit(1);
+            }
+            else if (rc == 0) {
+                printf("Connection closed by client with fd = %d \n", client_fd);
+                // break and continue to wait for other clients in run_server
+                return;
+                // break;
+            }
+        }
 
         if(L0->heap_size == L0->length) {
             buffer_flush();  
@@ -831,25 +962,38 @@ void buffer_load(char* filename) {
                     q.type = PUT;
                     q.inp1 = atoi(strtok(NULL, delims));
                     q.inp2 = atoi(strtok(NULL, delims));
+                    pthread_rwlock_wrlock(&rwlock);
                     buffer_insert(q);
+                    pthread_rwlock_unlock(&rwlock);
                     break;
                 case 'd': 
                     q.type = DELETE;
                     q.inp1 = atoi(strtok(NULL, delims));
+                    pthread_rwlock_wrlock(&rwlock);
                     buffer_insert(q);
+                    pthread_rwlock_unlock(&rwlock);
                     break;
                 case 'g': 
                     q.type = GET;
                     q.inp1 = atoi(strtok(NULL, delims));
-                    get(q.inp1);
+                    pthread_rwlock_rdlock(&rwlock);
+                    // itoa(get(q.inp1), val, 10);
+                    sprintf(val,"%d",get(q.inp1)); 
+                    pthread_rwlock_unlock(&rwlock);
+                    write(client_fd, val, strlen(val));
                     break; 
                 case 'r': 
                     q.type = RANGE;
                     q.inp1 = atoi(strtok(NULL, delims));
                     q.inp2 = atoi(strtok(NULL, delims));
+                    pthread_rwlock_rdlock(&rwlock);
+                    // range() // TODO : range query
+                    pthread_rwlock_unlock(&rwlock);
                     break; 
                 // case 's':
-                // case 'l':
+                case 'l':
+                    buffer_load(static_workload);
+                    break;
                 default: 
                     printf("Error : Invalid Command"); 
                     exit(1);
@@ -857,7 +1001,53 @@ void buffer_load(char* filename) {
         }
     }
 
-    fclose(fp);
+    close(client_fd);
+}
+
+
+void run_server() {
+
+    struct sockaddr_un addr;
+    int client_fd;
+    int socket_fd;
+
+    if ( (socket_fd = socket(AF_UNIX, SOCK_STREAM, 0)) == -1) {
+        perror("socket error");
+        exit(-1);
+    }
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    
+    if (*socket_path == '\0') {
+        *addr.sun_path = '\0';
+        strncpy(addr.sun_path+1, socket_path+1, sizeof(addr.sun_path)-2);
+    } else {
+        strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path)-1);
+        unlink(socket_path);
+    }
+
+    if (bind(socket_fd, (struct sockaddr*) &addr, sizeof(addr)) == -1) {
+        perror("bind error");
+        exit(-1);
+    }
+
+    // TODO : experiment with backlog (queue) value...change from 5 to 10 or 32...
+    if (listen(socket_fd, 5) == -1) {
+        perror("listen error");
+        exit(-1);
+    }
+
+    while (1) {
+        if ( (client_fd = accept(socket_fd, NULL, NULL)) == -1) {
+            perror("accept error");
+            continue;
+        }
+
+        threadpool_add(pool, client_handler, (void*) &client_fd , 1);
+    }
+
+    return ;
 }
 
 
@@ -872,6 +1062,8 @@ int main(int argc, char* argv[]) {
         switch(opt) {
             case 'r':
                 SZ_RATIO = atoi(optarg);
+                // K = SZ_RATIO - 1;
+                // Z = SZ_RATIO - 1
                 break;
 
             case 'b':
@@ -918,12 +1110,21 @@ int main(int argc, char* argv[]) {
 
     //  If there is already data in the data directory, then load 
     // in the auxilliary bloom/fence data as well as the buffer, otherwise run levels_init
-    // startup():
+    // if(dir_empty(data_dir)) {
+    //     levels_load();
+    // } else {
+    //     buffer_init();
+    //     levels_init();
+    // }
+
+
 
     buffer_init();
-    locks_init();
     levels_init();
+
+    locks_init();
     pool = threadpool_create(MAX_THREADS, MAX_QUEUE, 0);
+    gettimeofday (&start, NULL);
     run_server();
 
     if(static_workload) {
@@ -937,48 +1138,38 @@ int main(int argc, char* argv[]) {
         diff_t = (((end.tv_sec - start.tv_sec)*1000000L
             +end.tv_usec) - start.tv_usec) / (1000000.0);
         printf("new buffer load time: %f\n", diff_t); 
-        // printf("\n\n\n\n");
-        // for(int i = 1; i <= L0->heap_size; i++) {
-        //     printf("%d : %d : %d\n",L0->data[i].del, L0->data[i].key, L0->data[i].val);
-        // }
-
-
         // for(int i = 1; i <= L0->heap_size; i++) {
         //     printf("%d : %d : %d\n",L0->data[i].del, L0->data[i].key, L0->data[i].val);
         // }
     }
 
 
-    gettimeofday (&start, NULL);
+    // char line[31];
+    // FILE *fp = fopen("test_wkload_32M.txt", "r");
+    // char* a;
+    // struct query q;
 
+    // while(fgets(line, sizeof(line), fp) != NULL) {
 
-    char line[31];
-    FILE *fp = fopen("test_wkload_32M.txt", "r");
-    char* a;
+    //     if(line[0] != '\n') {
 
-    struct query q;
+    //         a = strtok(line, delims);
 
-    while(fgets(line, sizeof(line), fp) != NULL) {
+    //         switch(a[0]) {
+    //             case 'p': 
+    //                 q.type = PUT;
+    //                 q.inp1 = atoi(strtok(NULL, delims));
+    //                 q.inp2 = atoi(strtok(NULL, delims));
+    //                 printf("%d  %d\n",q.inp1,get(q.inp1));
+    //                 break;
+    //             default: 
+    //                 printf("Error : Invalid Command"); 
+    //                 exit(1);
+    //         }   
+    //     }
+    // }
 
-        if(line[0] != '\n') {
-
-            a = strtok(line, delims);
-
-            switch(a[0]) {
-                case 'p': 
-                    q.type = PUT;
-                    q.inp1 = atoi(strtok(NULL, delims));
-                    q.inp2 = atoi(strtok(NULL, delims));
-                    printf("%d  %d\n",q.inp1,get(q.inp1));
-                    break;
-                default: 
-                    printf("Error : Invalid Command"); 
-                    exit(1);
-            }   
-        }
-    }
-
-    fclose(fp);
+    // fclose(fp);
 
     // printf("get is %d\n",get(730962444));
     gettimeofday (&end, NULL);
@@ -997,155 +1188,132 @@ int main(int argc, char* argv[]) {
 }
 
 
-void run_server() {
-
-    struct sockaddr_un addr;
-    int client_fd;
-    int socket_fd;
-
-    if ( (socket_fd = socket(AF_UNIX, SOCK_STREAM, 0)) == -1) {
-        perror("socket error");
-        exit(-1);
-    }
-
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    
-    if (*socket_path == '\0') {
-        *addr.sun_path = '\0';
-        strncpy(addr.sun_path+1, socket_path+1, sizeof(addr.sun_path)-2);
-    } else {
-        strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path)-1);
-        unlink(socket_path);
-    }
-
-    if (bind(socket_fd, (struct sockaddr*) &addr, sizeof(addr)) == -1) {
-        perror("bind error");
-        exit(-1);
-    }
-
-    // TODO : experiment with backlog (queue) value...change from 5 to 10 or 32...
-    if (listen(socket_fd, 5) == -1) {
-        perror("listen error");
-        exit(-1);
-    }
-
-    while (1) {
-        if ( (client_fd = accept(socket_fd, NULL, NULL)) == -1) {
-            perror("accept error");
-            continue;
-        }
-
-        threadpool_add(pool, client_handler, (void*) &client_fd , 1);
-    }
-
-    return 0;
-}
 
 
 
-// load queries statically from a file
-// TODO : change buffer_load to this function to handle load command .bin files
-void buffer_load(char* filename) {
-
-    struct query q;
-    struct stat statbuf;
-    int fd = open(filename, O_RDONLY, S_IRUSR | S_IWUSR);
-  
-    if (fstat (fd, &statbuf) < 0) {
-        printf ("fstat error");
-        return 0;
-    }
-
-    struct keyval* m_out = mmap(NULL, statbuf.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    int num_entries = statbuf.st_size  / sizeof(struct keyval);
-
-    for(int i = 0; i < num_entries; i++) {
-
-        if(L0->heap_size == L0->length) {
-            buffer_flush();  
-        } else {
-            q.type = PUT;
-            q.inp1 = m_out[i].val;
-            q.inp2 = m_out[i].val;
-            buffer_insert(q);
-        }        
-    }
-
-    munmap(m_out, statbuf.st_size);
-    close(out)
-}
 
 
-void client_handler(void* client) {
 
-    int client_fd = *((int*) client);
-    int rc;
-    char line[31];
-    char* a;
-    struct query q;
 
-    char val[15];
-    // char* buf = (char*) malloc(sizeof(struct entry) * );
-    // while ((rc = read(client_fd,buf, sizeof(buf))) > 0) {
-    //     printf("read %u bytes: %.*s\n", rc, rc, buf);
-    // }
 
-    while ((rc = read(client_fd, line, sizeof(line))) > 0) {
 
-        if(L0->heap_size == L0->length) {
-            buffer_flush();  
-        }
 
-        if(line[0] != '\n') {
 
-            a = strtok(line, delims);
 
-            switch(a[0]) {
-                case 'p': 
-                    q.type = PUT;
-                    q.inp1 = atoi(strtok(NULL, delims));
-                    q.inp2 = atoi(strtok(NULL, delims));
-                    pthread_rwlock_wrlock(&rwlock);
-                    buffer_insert(q);
-                    pthread_rwlock_unlock(&rwlock);
-                    break;
-                case 'd': 
-                    q.type = DELETE;
-                    q.inp1 = atoi(strtok(NULL, delims));
-                    pthread_rwlock_wrlock(&rwlock);
-                    buffer_insert(q);
-                    pthread_rwlock_unlock(&rwlock);
-                    break;
-                case 'g': 
-                    q.type = GET;
-                    q.inp1 = atoi(strtok(NULL, delims));
-                    pthread_rwlock_rdlock(&rwlock);
-                    itoa(get(q.inp1), val, 10);
-                    pthread_rwlock_unlock(&rwlock);
-                    write(client_fd, val, nread);
-                    break; 
-                case 'r': 
-                    q.type = RANGE;
-                    q.inp1 = atoi(strtok(NULL, delims));
-                    q.inp2 = atoi(strtok(NULL, delims));
-                    pthread_rwlock_rdlock(&rwlock);
-                    // range() // TODO : range query
-                    pthread_rwlock_unlock(&rwlock);
-                    break; 
-                // case 's':
-                case 'l':
-                    buffer_load(static_workload);
-                    break;
-                default: 
-                    printf("Error : Invalid Command"); 
-                    exit(1);
-            }   
-        }
-    }
 
-    close(client_fd);
-}
+
+
+
+
+
+// struct buffer {
+//     struct entry* data;
+//     int heap_size;
+//     int length;
+// };
+
+
+// struct run {
+//     struct fence* fences;
+//     char* file;
+//     char* bloom;
+//     // int bits_per_entry;
+//     // int num_hash;
+// };
+
+// struct level {
+//     struct run* runs;
+//     int run_cnt;
+//     int bits_per_entry; // # of bits per entry in bloom filters of this level
+//     int num_hash;
+//     int entries_per_run; // # of entries per run. This is the max since some runs will have less due to deletes/updates
+//     enum policy pol;
+// };
+
+
+// void levels_load() {
+
+//     NUM_LEVELS = (int) ceil(log((((double) MAX_MEM) / ((double) M_BUFFER)) * 
+//                 (((double) (SZ_RATIO-1)) / ((double) SZ_RATIO))) / log(SZ_RATIO));
+
+//     levels = (struct level*) malloc(sizeof(struct level) * NUM_LEVELS);
+
+//     // user supplies bits per entry for level 1 (L1_BPE)
+//     double p1 = exp(-L1_BPE * pow(log(2),2));
+//     // get the # of levels for which we assign bloom filters. All levels >= this one will not be given any filters
+//     int filtered_levels =  (int) floor((((double) L1_BPE) * pow(log(2),2)) / (log(SZ_RATIO)));
+//     int bits_per_entry;
+//     int entries_per_run;
+//     int num_hash;
+//     // int extra;
+
+//     // below loop is just for a tiering policy, allocates SZ_RATIO runs
+//     // TODO : make this a separate function and create another function for the leveling policy in a run. 
+//     // User should indicate what type of policy to use in each level (maybe via some kind of struct). 
+//     for(int i = 0; i < NUM_LEVELS; i++) {
+
+//         bits_per_entry = (int) ceil(-log(pow(SZ_RATIO, i) * p1) / pow(log(2),2));
+//         entries_per_run = (int) (L0->length * pow(SZ_RATIO, i));
+//         num_hash = (int) ceil(((double) bits_per_entry) * log(2));
+
+//         levels[i].bits_per_entry = bits_per_entry;
+//         levels[i].num_hash = num_hash;
+//         levels[i].runs = (struct run*) malloc(sizeof(struct run) * SZ_RATIO);
+//         levels[i].run_cnt = 0;
+//         levels[i].entries_per_run = entries_per_run;
+
+//         if(i < filtered_levels) {
+//             for(int j = 0; j < SZ_RATIO; j++) {
+
+//                 // read in bloom_f and fences from files
+//                 levels[i].runs[j].bloom = (char*) calloc((entries_per_run * bits_per_entry) / 8, 1);
+//                 levels[i].runs[j].fences = (struct fence*) malloc(sizeof(struct fence) * 
+//                                     ((sizeof(struct entry) * entries_per_run) / PAGE_SZ) );
+//             }
+//         } else {
+//             for(int j = 0; j < SZ_RATIO; j++) {
+
+//                 levels[i].runs[j].bloom = NULL; // no allocation of bloom_f for unfiltered levels
+//                 levels[i].runs[j].fences = (struct fence*) malloc(sizeof(struct fence) * 
+//                                     ((sizeof(struct entry) * entries_per_run) / PAGE_SZ) );
+//             }
+//         }
+//     }
+// }
+
+
+
+
+
+
+
+// int dir_empty(const char *path) {
+//     struct dirent *ent;
+//     int ret = 1;
+
+//     DIR *d = opendir(path);
+//     if (!d) {
+//         fprintf(stderr, "%s: ", path);
+//         perror("");
+//         return -1;
+//     }
+
+//     while ((ent = readdir(d))) {
+//         if (!strcmp(ent->d_name, ".") || !(strcmp(ent->d_name, "..")))
+//             continue;
+//         ret = 0;
+//         break;
+//     }
+
+//     closedir(d);
+//     return ret;
+// }
+
+
+
+
+
+
 
 
 // Save the bloom filters and fence pointer arrays in each level to disk
@@ -1224,51 +1392,6 @@ void locks_destroy() {
     free(groups);
 }
 
-    // struct stat sb;
-
-    // // int fd = fileno(fp);
-    // int fs = open(file)
-    // if(fstat(fd, &sb) == -1) {
-    //     perror("Error: Could not open file\n");
-    // }
-    // printf("file size is %lld\n", sb.st_size);
-
-    // char* file_in_memory = mmap(NULL, sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    // for(int i = 0; i < sb.st_size; i++) {
-    //     printf("%c", file_in_memory[i]);
-    // }
-    // printf("\n");
-
-    // munmap(file_in_memory, sb.st_size);
-    // fclose(fp);
-    // exit(1);
-
-    // get size of the ss_table index block = ind_block_size
-    // char* file_in_memory = mmap(NULL, ind_block_size, PROT_READ, MAP_PRIVATE fd, 0);
-    // If you find the desired index in on of the block ranges during a read (GET),
-    //      read that chunk of the file starting at desired offset 
-
-
-    // MAXTHREADS = atoi(argv[1]);
-
-    // when the buffer is full:
-    //     -sort the array (check using either qsort or heapsort1)
-    //     -flush to disk by doing
-    //     fwrite(buf->data + 1, M_BUFFER, ); i.e. start at the 1st index (not 0th) 
-                                    // of the struct and get all memory after that
-
-        // printf("%d : %d : %d\n",queries[i].type, queries[i].inp1, queries[i].inp2);
-    
-    // pthread_rwlock_t rwlock;
-    // pthread_rwlock_init(&rwlock,NULL);
-    // // look for new clients always
-    // for each client {
-    //  // add their queries to the threadpool 
-    //     threadpool_add(pool, http_proxy, (void*) requests[i].url, 1);
-    // }
-
-    // pthread_rwlock_destroy(&rwlock);
-    // threadpool_destroy(pool, 1);
 
 // ********************* NOTES ***********************
 
@@ -1526,6 +1649,11 @@ void locks_destroy() {
 
 
 
-
+ // LSM-tree later sort-merges these runs to bound the number of runs that a lookup has to probe and to remove obsolete
+ //  entries, i.e., for which there exists a more recent entry with the same key. LSM-tree organizes runs into levels of
+ //   expo- nentially increasing capacities whereby larger levels contain older runs. As entries are updated out-of-place,
+ //    a point lookup finds the most recent version of an entry by probing the levels from smallest to largest and 
+ //    terminating when it finds the target key. A range lookup, on the other hand, has to access the relevant key range 
+ //    from across all runs at all levels and to eliminate obsolete entries from the result set.
 
 
