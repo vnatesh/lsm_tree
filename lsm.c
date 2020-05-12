@@ -136,6 +136,7 @@ void buffer_heapify(int i);
 int comparator(const void* e1, const void* e2);
 void buffer_qsort();
 void buffer_load(char* filename);
+void buffer_load_static(char* filename);
 void buffer_insert(struct query q);
 void buffer_free();
 void buffer_flush();
@@ -368,7 +369,6 @@ void build_fences(struct entry* data, int l, int r) {
 
 // binary search through fence pointers of a run. Return value of associated key if found, otherwise 0.
 // TODO : the last fence is wrong since it wont be at a perfect offset of 4096. 
-// TODO : try linear search, see if its faster
 int search_fences(int key, int l, int r) {
 
     int left = 0;
@@ -446,7 +446,6 @@ int comparator(const void* e1, const void* e2) {
 
 
 
-static int flush_cnt = 0;
 // TODO : make sure you don't flush the buffer while a merge is happening on
 // level 0. Level 0 will be full so any flushing will overwrite
 void buffer_flush() {
@@ -481,8 +480,7 @@ void buffer_flush() {
 
     L0->heap_size = 0;
     curr_merge_lev = 0;
-    // // launch merge/flush on separate thread so it happens in background
-    // threadpool_add(pool, merge_and_flush, (void*) &curr_merge_lev , 1);
+    // launch merge/flush on separate thread so it happens in background
     merge_and_flush((void*) &curr_merge_lev);
 }
 
@@ -492,7 +490,6 @@ void merge_and_flush(void* p) {
     // cascading flush to disk if num_files in level i == SZ_RATIO
     while(1) {
         if(levels[curr_merge_lev].run_cnt == SZ_RATIO) {
-            flush_cnt++;
             merge_filesize = (int) (L0->length * pow(SZ_RATIO, curr_merge_lev));
             launch_merge();
             curr_merge_lev++;
@@ -596,7 +593,6 @@ void launch_merge() {
 
     // rwlock write lock the levels table, and delete all old files and intermediate files, update
     // levels metadata so readers see a consistent snapshot of the data
-    // TODO : only lock
     pthread_rwlock_wrlock(&rwlock);
     levels[l+1].run_cnt++;
     levels[l].run_cnt = 0;
@@ -651,10 +647,8 @@ struct file_pair* k_way_merge(int start, int end, int g_id) {
         sprintf(q[ind][p_ind].f2, "data/file_%d_%d.bin", curr_merge_lev, i+1);
         sprintf(q[ind][p_ind].out_f, "merge/out_%d_%d.bin", i+1, ind);
         q[ind][p_ind].group = g_id;
-
         q[ind][p_ind].f1_size = merge_filesize;
         q[ind][p_ind].f2_size = merge_filesize;
-
         p_ind++;
     } 
 
@@ -671,10 +665,8 @@ struct file_pair* k_way_merge(int start, int end, int g_id) {
             sprintf(q[ind][p_ind].f2, "merge/out_%d_%d.bin", i + start + j - 1, ind - 1);
             sprintf(q[ind][p_ind].out_f, "merge/out_%d_%d.bin", i + start + j - 1, ind);
             q[ind][p_ind].group = g_id;
-
             q[ind][p_ind].f1_size = merge_filesize * j;
             q[ind][p_ind].f2_size = merge_filesize * j;
-
             p_ind++;
         }
 
@@ -716,21 +708,27 @@ void binary_merge(void* inp) {
     struct entry* m2 = mmap(NULL, inp_size2, PROT_READ, MAP_PRIVATE, fd2, 0);
 
     int out = open(f_pair.out_f, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
-
     ftruncate(out, out_size);
 
     // create output mmap of size equal to sum of input files
     struct entry* m_out = mmap(NULL, out_size, PROT_READ | PROT_WRITE, MAP_SHARED, out, 0);
 
     // merge algorithm. 
-    // TODO : Do updates and deletes here
     int i = 0;
     int j = 0;
     int k = 0;
 
     while (i < f_pair.f1_size && j < f_pair.f2_size) {
-        if(m1[i].key <= m2[j].key) {
+
+        if(m1[i].del) {             // skip m1 entry if del
+            i++;
+        } else if(m2[j].del) {      // skip m2 entry if del
+            j++;
+        } else if(m1[i].key < m2[j].key) {
             m_out[k] = m1[i];
+            i++; 
+        } else if(m1[i].key == m2[j].key) {  // keep most recent data i.e. m2 for update
+            m_out[k] = m2[j];
             i++; 
         } else { 
             m_out[k] = m2[j];
@@ -740,15 +738,21 @@ void binary_merge(void* inp) {
     } 
 
     while (i < f_pair.f1_size) {
-        m_out[k] = m1[i];
+
+        if(!m1[i].del) {
+            m_out[k] = m1[i];
+            k++; 
+        }
         i++; 
-        k++; 
     } 
   
     while (j < f_pair.f2_size) {
-        m_out[k] = m2[j];
+    
+        if(!m2[j].del) {
+            m_out[k] = m2[j];
+            k++; 
+        }
         j++; 
-        k++; 
     } 
 
     munmap(m1, inp_size1);
@@ -788,11 +792,7 @@ int get(int key) {
     return val;
 }
 
-// If multiple runs that are being sort-merged contain entries with the same key, 
-// only the entry from the most recently-created (youngest) run is kept because it 
-// is the most up-to-date. Thus, the resulting run may be smaller than the cumulative sizes of the original runs. When
-// a merge operation is finished, the resulting run moves to Level i + 1
-// if Level i is at capacity.
+
 void buffer_insert(struct query q) {
 
     L0->heap_size++;
@@ -801,7 +801,7 @@ void buffer_insert(struct query q) {
         L0->data[L0->heap_size].key = q.inp1;
         L0->data[L0->heap_size].val = q.inp2;
         L0->data[L0->heap_size].del = false;
-    } else {
+    } else if(q.type == DELETE){
         L0->data[L0->heap_size].key = q.inp1;
         L0->data[L0->heap_size].del = true;
     }
@@ -819,61 +819,60 @@ void buffer_insert(struct query q) {
 
 
 // // load queries statically from a file
-// void buffer_load(char* filename) {
+void buffer_load_static(char* filename) {
 
-//     char line[31];
-//     FILE *fp = fopen(filename, "r");
-//     char* a;
+    char line[31];
+    FILE *fp = fopen(filename, "r");
+    char* a;
 
-//     struct query q;
+    struct query q;
 
-//     while(fgets(line, sizeof(line), fp) != NULL) {
+    while(fgets(line, sizeof(line), fp) != NULL) {
 
-//         if(L0->heap_size == L0->length) {
-//             buffer_flush();  
-//         }
+        if(L0->heap_size == L0->length) {
+            buffer_flush();  
+        }
 
-//         if(line[0] != '\n') {
+        if(line[0] != '\n') {
 
-//             a = strtok(line, delims);
+            a = strtok(line, delims);
 
-//             switch(a[0]) {
-//                 case 'p': 
-//                     q.type = PUT;
-//                     q.inp1 = atoi(strtok(NULL, delims));
-//                     q.inp2 = atoi(strtok(NULL, delims));
-//                     buffer_insert(q);
-//                     break;
-//                 case 'd': 
-//                     q.type = DELETE;
-//                     q.inp1 = atoi(strtok(NULL, delims));
-//                     buffer_insert(q);
-//                     break;
-//                 case 'g': 
-//                     q.type = GET;
-//                     q.inp1 = atoi(strtok(NULL, delims));
-//                     get(q.inp1);
-//                     break; 
-//                 case 'r': 
-//                     q.type = RANGE;
-//                     q.inp1 = atoi(strtok(NULL, delims));
-//                     q.inp2 = atoi(strtok(NULL, delims));
-//                     break; 
-//                 // case 's':
-//                 // case 'l':
-//                 default: 
-//                     printf("Error : Invalid Command"); 
-//                     exit(1);
-//             }   
-//         }
-//     }
+            switch(a[0]) {
+                case 'p': 
+                    q.type = PUT;
+                    q.inp1 = atoi(strtok(NULL, delims));
+                    q.inp2 = atoi(strtok(NULL, delims));
+                    buffer_insert(q);
+                    break;
+                case 'd': 
+                    q.type = DELETE;
+                    q.inp1 = atoi(strtok(NULL, delims));
+                    buffer_insert(q);
+                    break;
+                case 'g': 
+                    q.type = GET;
+                    q.inp1 = atoi(strtok(NULL, delims));
+                    printf("%d\n",get(q.inp1));
+                    break; 
+                case 'r': 
+                    q.type = RANGE;
+                    q.inp1 = atoi(strtok(NULL, delims));
+                    q.inp2 = atoi(strtok(NULL, delims));
+                    break; 
+                // case 's':
+                // case 'l':
+                default: 
+                    printf("Error : Invalid Command"); 
+                    exit(1);
+            }   
+        }
+    }
 
-//     fclose(fp);
-// }
+    fclose(fp);
+}
 
 
-// load queries statically from a file
-// TODO : change buffer_load to this function to handle load command .bin files
+// load put queries statically from a file
 void buffer_load(char* filename) {
 
     struct query q;
@@ -918,11 +917,6 @@ void client_handler(void* client) {
     struct timeval timeout;
     fd_set readfds;
 
-    // char* buf = (char*) malloc(sizeof(struct entry) * );
-    // while ((rc = read(client_fd,buf, sizeof(buf))) > 0) {
-    //     printf("read %u bytes: %.*s\n", rc, rc, buf);
-    // }
-
     while (1) {
 
         FD_ZERO(&readfds);
@@ -944,8 +938,7 @@ void client_handler(void* client) {
             else if (rc == 0) {
                 printf("Connection closed by client with fd = %d \n", client_fd);
                 // break and continue to wait for other clients in run_server
-                return;
-                // break;
+                break;
             }
         }
 
@@ -1038,18 +1031,17 @@ void run_server() {
         exit(-1);
     }
 
-    while (1) {
-        if ( (client_fd = accept(socket_fd, NULL, NULL)) == -1) {
-            perror("accept error");
-            continue;
-        }
-
+    while ((client_fd = accept(socket_fd, NULL, NULL)) != -1) {
         threadpool_add(pool, client_handler, (void*) &client_fd , 1);
     }
 
     return ;
 }
 
+
+
+
+static char* next_put = NULL;
 
 int main(int argc, char* argv[]) {
 
@@ -1058,7 +1050,7 @@ int main(int argc, char* argv[]) {
     struct timeval start, end;
     double diff_t;
 
-    while((opt = getopt(argc, argv, "r:b:c:d:e:f::")) != -1) { // optional argument for static workload -f is denoted by ::
+    while((opt = getopt(argc, argv, "r:b:c:d:e:f::g::")) != -1) { // optional argument for static workload -f is denoted by ::
         switch(opt) {
             case 'r':
                 SZ_RATIO = atoi(optarg);
@@ -1072,6 +1064,10 @@ int main(int argc, char* argv[]) {
 
             case 'f':
                 static_workload = optarg;
+                break;
+
+            case 'g':
+                next_put = optarg;
                 break;
 
             case 'c':
@@ -1118,31 +1114,40 @@ int main(int argc, char* argv[]) {
     // }
 
 
-
     buffer_init();
     levels_init();
-
     locks_init();
     pool = threadpool_create(MAX_THREADS, MAX_QUEUE, 0);
-    gettimeofday (&start, NULL);
-    run_server();
+    printf("ready\n");
 
     if(static_workload) {
+        gettimeofday (&start, NULL);
+        buffer_load_static(static_workload);
+        // printf("heap size : %d\n", L0->heap_size);
+        gettimeofday (&end, NULL);
+        diff_t = (((end.tv_sec - start.tv_sec)*1000000L
+            +end.tv_usec) - start.tv_usec) / (1000000.0);
+        printf("del time: %f\n", diff_t); 
+        // for(int i = 1; i <= L0->heap_size; i++) {
+        //     printf("%d : %d : %d\n",L0->data[i].del, L0->data[i].key, L0->data[i].val);
+
+        // }
+    } else {
+        run_server();
+    }
+
+
+    if(next_put) {
 
         gettimeofday (&start, NULL);
-
-        buffer_load(static_workload);
-
+        buffer_load_static(next_put);
         printf("heap size : %d\n", L0->heap_size);
         gettimeofday (&end, NULL);
         diff_t = (((end.tv_sec - start.tv_sec)*1000000L
             +end.tv_usec) - start.tv_usec) / (1000000.0);
-        printf("new buffer load time: %f\n", diff_t); 
+        printf("put time: %f \n", diff_t); 
         // for(int i = 1; i <= L0->heap_size; i++) {
-        //     printf("%d : %d : %d\n",L0->data[i].del, L0->data[i].key, L0->data[i].val);
-        // }
     }
-
 
     // char line[31];
     // FILE *fp = fopen("test_wkload_32M.txt", "r");
@@ -1172,10 +1177,10 @@ int main(int argc, char* argv[]) {
     // fclose(fp);
 
     // printf("get is %d\n",get(730962444));
-    gettimeofday (&end, NULL);
-    diff_t = (((end.tv_sec - start.tv_sec)*1000000L
-        +end.tv_usec) - start.tv_usec) / (1000000.0);
-    printf("Read time: %f\n", diff_t); 
+    // gettimeofday (&end, NULL);
+    // diff_t = (((end.tv_sec - start.tv_sec)*1000000L
+    //     +end.tv_usec) - start.tv_usec) / (1000000.0);
+    // printf("Read time: %f\n", diff_t); 
 
 
     buffer_free();
@@ -1308,10 +1313,6 @@ int main(int argc, char* argv[]) {
 //     closedir(d);
 //     return ret;
 // }
-
-
-
-
 
 
 
