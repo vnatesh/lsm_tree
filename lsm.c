@@ -162,6 +162,7 @@ int search_fences(int key, int l, int r);
 
 // reads
 int get(int key);
+void range(int key1, int key2);
 
 // level management
 void levels_init();
@@ -818,6 +819,58 @@ void buffer_insert(struct query q) {
 }
 
 
+
+
+void range(int key1, int key2) {
+
+    for(int i = 0; i < L0->heap_size; i++) {
+        if(L0->data[i].key >= key1 && L0->data[i].key <= key2 ) {
+            printf("");
+            // printf("%d\n", L0->data[i].val );
+        }
+    }
+
+    char f[31];
+    int sz;
+    int fd;
+    struct entry* m;
+    // if not found in buffer, search LSM tree on disk
+    for(int i = 0; i < NUM_LEVELS; i++) {
+        for(int j = levels[i].run_cnt - 1; j >= 0; j--) { // Go to most recent run first since it may contain updated keys
+            // printf("HEYYY\n");
+            sprintf(f, "data/file_%d_%d.bin", i, j);
+            // printf("%s\n", f);
+            sz = ((int) (L0->length * pow(SZ_RATIO, i))); 
+            fd = open(f, O_RDONLY, S_IRUSR | S_IWUSR);
+            m = mmap(NULL, sz * sizeof(struct entry), PROT_READ, MAP_PRIVATE, fd, 0);
+
+            int tmp = 0;
+            for(int k = 0; k < sz; k++) {
+                if(m[k].key >= key1) {
+                    tmp = k;
+                    break;
+                }
+            }
+
+            if(tmp) {
+                for(int k = tmp; k < sz; k++) {
+                    if(m[k].key <= key2) {
+                        // printf("%d\n", m[k].val);
+                        printf("");
+                    }
+                }
+
+            }
+            munmap(m, sz * sizeof(struct entry));
+            close(fd);
+        }
+    }
+    
+}
+
+
+
+
 // // load queries statically from a file
 void buffer_load_static(char* filename) {
 
@@ -852,12 +905,14 @@ void buffer_load_static(char* filename) {
                 case 'g': 
                     q.type = GET;
                     q.inp1 = atoi(strtok(NULL, delims));
-                    printf("%d\n",get(q.inp1));
+                    // printf("%d\n",get(q.inp1));
+                    get(q.inp1);
                     break; 
                 case 'r': 
                     q.type = RANGE;
                     q.inp1 = atoi(strtok(NULL, delims));
                     q.inp2 = atoi(strtok(NULL, delims));
+                    range(q.inp1, q.inp2);
                     break; 
                 // case 's':
                 // case 'l':
@@ -980,7 +1035,7 @@ void client_handler(void* client) {
                     q.inp1 = atoi(strtok(NULL, delims));
                     q.inp2 = atoi(strtok(NULL, delims));
                     pthread_rwlock_rdlock(&rwlock);
-                    // range() // TODO : range query
+                    range(q.inp1, q.inp2);
                     pthread_rwlock_unlock(&rwlock);
                     break; 
                 // case 's':
@@ -1127,7 +1182,7 @@ int main(int argc, char* argv[]) {
         gettimeofday (&end, NULL);
         diff_t = (((end.tv_sec - start.tv_sec)*1000000L
             +end.tv_usec) - start.tv_usec) / (1000000.0);
-        printf("del time: %f\n", diff_t); 
+        // printf("del time: %f\n", diff_t); 
         // for(int i = 1; i <= L0->heap_size; i++) {
         //     printf("%d : %d : %d\n",L0->data[i].del, L0->data[i].key, L0->data[i].val);
 
@@ -1141,11 +1196,11 @@ int main(int argc, char* argv[]) {
 
         gettimeofday (&start, NULL);
         buffer_load_static(next_put);
-        printf("heap size : %d\n", L0->heap_size);
+        // printf("heap size : %d\n", L0->heap_size);
         gettimeofday (&end, NULL);
         diff_t = (((end.tv_sec - start.tv_sec)*1000000L
             +end.tv_usec) - start.tv_usec) / (1000000.0);
-        printf("put time: %f \n", diff_t); 
+        printf("range time: %f \n", diff_t); 
         // for(int i = 1; i <= L0->heap_size; i++) {
     }
 
